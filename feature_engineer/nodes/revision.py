@@ -136,10 +136,13 @@ RULES:
   2. Do NOT use pd.get_dummies(), pd.concat, or pd.DataFrame.
   3. Do NOT use placeholder strings — use real values from the schema below.
   4. DATETIME RULE: wrap BOTH sides with pd.to_datetime() when subtracting dates.
-  5. APPLY vs TRANSFORM RULE: NEVER use groupby().apply() — it changes the index → NaN.
-     ALWAYS use transform() or pre-multiply then transform:
-     WRONG: df.groupby('x').apply(lambda x: (x['a']*x['b']).sum()) → NaN
-     RIGHT: (df['a'] * df['b']).groupby(df['x']).transform('sum')  → correct
+  5. APPLY vs TRANSFORM RULE (CRITICAL — applies to ALL groupby aggregations):
+     NEVER use groupby() without transform() — it changes the index → NaN.
+     This applies to: .mean(), .sum(), .count(), .min(), .max(), .std(), .apply()
+     WRONG: df.groupby('x')['a'].mean()           → NaN when assigned to df
+     RIGHT: df.groupby('x')['a'].transform('mean') → correct ✓
+     WRONG: df.groupby('x')['a'].sum()            → NaN
+     RIGHT: df.groupby('x')['a'].transform('sum') → correct ✓
 
   6. PD.CUT RULE: labels must be exactly len(bins) - 1.
      bins has N edges → N-1 intervals → N-1 labels required.

@@ -67,6 +67,13 @@ class FeasibleFeatureList(BaseModel):
     )
 
 
+class RankedFeature(BaseModel):
+    """A single ranked feature with its predictive value score."""
+    name:        str = Field(description="Feature name matching a feasible_feature label")
+    rank:        int = Field(description="Rank position starting from 1 (1 = most valuable)")
+    reason:      str = Field(description="One-line reason for this ranking position")
+
+
 class FeaturePlan(BaseModel):
     """LLM-produced specification for a single feature column."""
     feature_name: str = Field(description="Snake-case name for the new column")
@@ -122,6 +129,7 @@ class AgentState(TypedDict):
     feature_queue:       list[dict]
     feature_candidates:  list[str]
     feasible_features:   list[str]
+    ranked_features:     list[str]                                    # feasible features ranked by predictive value
     good_candidates:     list[str]
     research_formula_hints: dict                                      # {feature_label: formula_hint}
     research_messages:   Annotated[list, add_messages]
@@ -154,6 +162,7 @@ def empty_state(
         feature_queue=[],
         feature_candidates=[],
         feasible_features=[],
+        ranked_features=[],
         good_candidates=[],
         research_formula_hints={},
         research_messages=[],

@@ -9,6 +9,7 @@ from feature_engineer.nodes.execution import (
 )
 from feature_engineer.nodes.ingestion import load_csv
 from feature_engineer.nodes.planning import feature_planner, validate_plan
+from feature_engineer.nodes.ranking import rank_features
 from feature_engineer.nodes.research import (
     extract_candidates, map_to_columns, research_features,
     research_tool_node, research_tools_condition,
@@ -33,6 +34,7 @@ def build_graph() -> StateGraph:
     g.add_node("extract_candidates", extract_candidates)
     g.add_node("evaluate_research",  evaluate_research)
     g.add_node("map_to_columns",     map_to_columns)
+    g.add_node("rank_features",      rank_features)
     g.add_node("feature_planner",    feature_planner)
     g.add_node("validate_plan",      validate_plan)
     g.add_node("validate_code",      validate_code)
@@ -47,8 +49,9 @@ def build_graph() -> StateGraph:
     g.add_edge(START,                "load_csv")
     g.add_edge("load_csv",           "research_features")
     g.add_edge("research_tools",     "research_features")
-    g.add_edge("extract_candidates", "evaluate_research")   # evaluate before mapping
-    g.add_edge("map_to_columns",     "feature_planner")
+    g.add_edge("extract_candidates", "evaluate_research")
+    g.add_edge("map_to_columns",     "rank_features")
+    g.add_edge("rank_features",      "feature_planner")
     g.add_edge("feature_planner",    "validate_plan")
     g.add_edge("validate_plan",      "validate_code")
     g.add_edge("create_feature",     "validate")

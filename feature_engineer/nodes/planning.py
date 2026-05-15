@@ -26,7 +26,8 @@ def feature_planner(state: AgentState) -> dict:
         else "\nDesign features that would add the most predictive value.\n"
     )
 
-    feasible = state.get("feasible_features", [])
+    # use ranked_features if available, fallback to feasible_features
+    feasible = state.get("ranked_features") or state.get("feasible_features", [])
     formula_hints = state.get("research_formula_hints", {})
 
     # clean feasible feature labels
@@ -73,6 +74,26 @@ def feature_planner(state: AgentState) -> dict:
     completed_formulas = state.get("completed_formulas", [])
     failed_formulas    = state.get("failed_formulas", [])
 
+    # detect feature types in feasible_clean for diversity enforcement
+    has_rolling = any("rolling" in f.lower() for f in feasible_clean)
+    has_lag     = any(("lag" in f.lower() or "shift" in f.lower() or "previous" in f.lower()) for f in feasible_clean)
+    has_ratio   = any(("ratio" in f.lower() or "per_capita" in f.lower() or "change" in f.lower()) for f in feasible_clean)
+
+    diversity_lines = []
+    if has_rolling:
+        diversity_lines.append("  - at least 1 rolling window feature (rolling mean, rolling std, etc.)")
+    if has_lag:
+        diversity_lines.append("  - at least 1 lag/shift feature (previous value, lagged value, etc.)")
+    if has_ratio:
+        diversity_lines.append("  - at least 1 ratio/difference/per-capita feature")
+
+    diversity_block = ""
+    if diversity_lines:
+        diversity_block = (
+            "\nDIVERSITY RULE: if feasible_features contains rolling, lag, or ratio features, "
+            "include at least one of each type present.\n"
+        )
+
     blacklist_block = ""
     if completed_formulas:
         blacklist_block += (
@@ -89,7 +110,7 @@ def feature_planner(state: AgentState) -> dict:
 
 Given this CSV schema:
 {schema_str}
-{hint_block}{feasible_block}{grouping_block}{blacklist_block}
+{hint_block}{feasible_block}{grouping_block}{diversity_block}{blacklist_block}
 Generate between 1 and {max_f} new feature columns.
 For each feature return a FeaturePlan with:
 - feature_name: short snake_case column name
@@ -110,13 +131,21 @@ GROUPBY RULE: if description says "per X", use groupby + transform.
 DATETIME RULE: wrap BOTH sides with pd.to_datetime() when subtracting dates.
   RIGHT: pd.to_datetime(df['date']) - pd.to_datetime(df.groupby('x')['date'].transform('min'))
 
-APPLY vs TRANSFORM RULE (CRITICAL):
-  NEVER use groupby().apply() to create a column — it changes the index and produces NaN.
-  ALWAYS use groupby().transform() or pre-multiply then transform:
-  WRONG: df.groupby('x').apply(lambda x: x['a'].sum())          → NaN column
-  RIGHT: df.groupby('x')['a'].transform('sum')                  → correct
-  WRONG: df.groupby('x').apply(lambda x: (x['a']*x['b']).sum()) → NaN column
-  RIGHT: (df['a'] * df['b']).groupby(df['x']).transform('sum')  → correct
+APPLY vs TRANSFORM RULE (CRITICAL — applies to ALL groupby aggregations):
+  NEVER use groupby() without transform() to create a column — it changes the index and produces NaN.
+  This applies to: .mean(), .sum(), .count(), .min(), .max(), .std(), .apply()
+  ALWAYS use .transform() to keep the original DataFrame index:
+
+  WRONG: df.groupby('x')['a'].mean()           → Series indexed by x → NaN when assigned
+  RIGHT: df.groupby('x')['a'].transform('mean') → Series indexed by df → correct ✓
+
+  WRONG: df.groupby('x')['a'].sum()            → NaN
+  RIGHT: df.groupby('x')['a'].transform('sum') → correct ✓
+
+  WRONG: df.groupby('x').apply(lambda x: x['a'].sum()) → NaN
+  RIGHT: (df['a']).groupby(df['x']).transform('sum')   → correct ✓
+
+  RULE: if you need a per-group statistic as a new column, ALWAYS use transform().
 
 PD.CUT RULE: labels must be exactly len(bins) - 1.
   bins=[a, b, c, d] → 3 intervals → labels must have 3 elements.
@@ -263,6 +292,9 @@ For each feature fill in:
     kept    = []
     dropped = []
 
+    # build lookup for deterministic overrides
+    feature_map = {f["feature_name"]: f for f in all_features}
+
     for v in result.verdicts:
         print(f"[validate_plan] '{v.feature_name}':")
         print(f"  grouping   : {v.grouping_col}")
@@ -270,12 +302,25 @@ For each feature fill in:
         print(f"  leakage    : {v.leakage_check}")
         print(f"  hint       : {v.hint_check}")
         verdict_str = v.verdict.lower()
+
+        match = feature_map.get(v.feature_name)
+
+        # deterministic override: shift(+N) is ALWAYS safe — never leakage
+        if match and verdict_str == "drop" and "shift" in v.drop_reason.lower():
+            code = match.get("pandas_code", "")
+            import re as _re
+            # check if shift argument is positive (no minus sign)
+            shift_args = _re.findall(r"\.shift\(([^)]+)\)", code)
+            if shift_args and not any(a.strip().startswith("-") for a in shift_args):
+                print(f"  verdict    : OVERRIDE → KEEP ✓ (shift with positive N is never leakage)")
+                kept.append(FeaturePlan(**match))
+                continue
+
         if v.drop_reason:
             print(f"  verdict    : {verdict_str.upper()} ← {v.drop_reason}")
         else:
             print(f"  verdict    : {verdict_str.upper()} ✓")
 
-        match = next((f for f in all_features if f["feature_name"] == v.feature_name), None)
         if match is None:
             print(f"  ⚠ WARNING: no match found for feature_name '{v.feature_name}' — "
                   f"available names: {[f['feature_name'] for f in all_features]}")

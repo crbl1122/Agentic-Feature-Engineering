@@ -37,6 +37,22 @@ def validate_code(state: AgentState) -> dict:
         return {"errors": [err]}
 
 
+def _fix_groupby_transform(code: str) -> str:
+    """Deterministically convert groupby().agg() → groupby().transform('agg').
+
+    LLMs consistently forget .transform() on groupby — this fixes it automatically
+    before eval so we never get NaN columns from index misalignment.
+    """
+    import re
+    for agg in ("mean", "sum", "count", "min", "max", "std", "median"):
+        code = re.sub(
+            rf"(df\.groupby\([^)]+\)\[[^\]]+\])\.{agg}\(\)",
+            rf"\1.transform('{agg}')",
+            code,
+        )
+    return code
+
+
 def create_feature(state: AgentState) -> dict:
     """Execute the LLM-generated pandas expression and attach the new column."""
     df   = path_to_df(state["df"]).copy()
@@ -61,7 +77,10 @@ def create_feature(state: AgentState) -> dict:
                 pass
 
     try:
-        new_col = eval(plan.pandas_code, {**_EVAL_NAMESPACE, "df": df})  # noqa: S307
+        fixed_code = _fix_groupby_transform(plan.pandas_code)
+        if fixed_code != plan.pandas_code:
+            print(f"[create_feature] Auto-fixed groupby: {plan.pandas_code} → {fixed_code}")
+        new_col = eval(fixed_code, {**_EVAL_NAMESPACE, "df": df})  # noqa: S307
         df[plan.feature_name] = new_col
         print(f"[create_feature] Added column '{plan.feature_name}'")
         df_to_path(df, thread_id_from_path(state["df"]))

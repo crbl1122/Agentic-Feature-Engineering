@@ -8,7 +8,7 @@ from feature_engineer.config import LLM_MODEL
 from feature_engineer.state import (
     FeaturePlan, FeaturePlanList, VerdictList,
     ResearchEvaluatorOutput, ResearchFeatureList,
-    EvaluationResult, FeasibleFeatureList,
+    EvaluationResult, FeasibleFeatureList, RankedFeature,
 )
 
 # base model — deterministic for planning, validation, revision
