@@ -13,6 +13,60 @@ from typing_extensions import TypedDict
 
 # ── Pydantic models ─────────────────────────────────────────────────────────────
 
+class ResearchEvaluatorOutput(BaseModel):
+    """Structured output for the research evaluator."""
+    feedback:    str  = Field(description="What is generic/wrong and what to search for instead")
+    is_specific: bool = Field(description="True if candidates are domain-specific feature names, not methodology categories")
+    retry_query: str  = Field(description="A better, more specific search query for the next attempt")
+
+
+class ResearchFeature(BaseModel):
+    """A single feature candidate produced by the research loop."""
+    name:         str = Field(description="Short snake_case feature name")
+    description:  str = Field(description="One-line description of what it measures")
+    formula_hint: str = Field(
+        description=(
+            "A pandas expression hint using the actual column names available. "
+            "Example: df['col_a'] / df['col_b']"
+        )
+    )
+
+
+class ResearchFeatureList(BaseModel):
+    """Curated list of feature candidates from research."""
+    features: list[ResearchFeature] = Field(
+        description="List of specific, computable feature candidates."
+    )
+
+
+class RejectionReason(BaseModel):
+    """Reason for rejecting a single candidate."""
+    candidate: str = Field(description="The rejected candidate name")
+    reason:    str = Field(description="Why it was rejected")
+
+
+class EvaluationResult(BaseModel):
+    """Structured output for the candidate evaluator."""
+    specific:          list[str]            = Field(description="Candidates that are specific, domain-relevant and computable")
+    generic:           list[str]            = Field(description="Candidates that are vague, generic, off-domain or identical to existing columns")
+    rejection_reasons: list[RejectionReason] = Field(description="Rejection reason per generic candidate", default_factory=list)
+
+
+class FeasibleFeature(BaseModel):
+    """A single feasible feature after column mapping."""
+    name:        str       = Field(description="Short snake_case feature name")
+    description: str       = Field(description="What it measures")
+    needs:       list[str] = Field(description="Column names required to compute this feature")
+    formula_hint: str      = Field(description="Pandas expression hint using available columns", default="")
+
+
+class FeasibleFeatureList(BaseModel):
+    """Features that can be computed from available CSV columns."""
+    features: list[FeasibleFeature] = Field(
+        description="Only features that can be meaningfully computed from available columns."
+    )
+
+
 class FeaturePlan(BaseModel):
     """LLM-produced specification for a single feature column."""
     feature_name: str = Field(description="Snake-case name for the new column")
@@ -60,20 +114,25 @@ class VerdictList(BaseModel):
 class AgentState(TypedDict):
     input_path:          str
     output_path:         str
-    objective:           str                                          # use case + constraints
+    objective:           str
     max_features:        int
-    df:                  str                                          # path to parquet
+    df:                  str
     original_columns:    list[str]
     plan:                FeaturePlan | None
     feature_queue:       list[dict]
     feature_candidates:  list[str]
     feasible_features:   list[str]
-    research_messages:   Annotated[list, add_messages]                # ReAct loop messages
+    good_candidates:     list[str]
+    research_formula_hints: dict                                      # {feature_label: formula_hint}
+    research_messages:   Annotated[list, add_messages]
+    research_attempts:   int
+    research_feedback:   str
+    research_is_specific: bool                                        # evaluator verdict
     completed_features:  Annotated[list[str],  lambda a, b: a + b]
     completed_plans:     Annotated[list[dict], lambda a, b: a + b]
-    completed_formulas:  Annotated[list[str],  lambda a, b: a + b]   # validated formulas
-    failed_formulas:     Annotated[list[str],  lambda a, b: a + b]   # failed formulas
-    errors:              Annotated[list[str],  lambda a, b: b]        # replace reducer
+    completed_formulas:  Annotated[list[str],  lambda a, b: a + b]
+    failed_formulas:     Annotated[list[str],  lambda a, b: a + b]
+    errors:              Annotated[list[str],  lambda a, b: b]
     attempts:            int
 
 
@@ -95,7 +154,12 @@ def empty_state(
         feature_queue=[],
         feature_candidates=[],
         feasible_features=[],
+        good_candidates=[],
+        research_formula_hints={},
         research_messages=[],
+        research_attempts=0,
+        research_feedback="",
+        research_is_specific=False,
         completed_features=[],
         completed_plans=[],
         completed_formulas=[],

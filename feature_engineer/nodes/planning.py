@@ -27,11 +27,48 @@ def feature_planner(state: AgentState) -> dict:
     )
 
     feasible = state.get("feasible_features", [])
-    feasible_block = (
-        "\nPrioritise generating features from this researched list of high-value candidates:\n"
-        + "\n".join(f"  - {f}" for f in feasible) + "\n"
-        if feasible else ""
-    )
+    formula_hints = state.get("research_formula_hints", {})
+
+    # clean feasible feature labels
+    def _clean_feasible(f: str) -> str:
+        base = f.split(" (")[0].strip()
+        name = base.split(":")[0].strip()
+        return name.lower().replace(" ", "_") + (": " + ":".join(base.split(":")[1:]).strip() if ":" in base else "")
+
+    feasible_clean = [_clean_feasible(f) for f in feasible]
+
+    # build feasible block with formula hints when available
+    if feasible_clean:
+        feasible_lines = []
+        for f in feasible_clean:
+            name = f.split(":")[0].strip()
+            hint = formula_hints.get(f, formula_hints.get(name, ""))
+            if hint:
+                feasible_lines.append(f"  - {f}  →  USE THIS FORMULA: {hint}")
+            else:
+                feasible_lines.append(f"  - {f}")
+        feasible_block = (
+            "\nPrioritise generating features from this researched list. "
+            "Where a formula hint is provided, USE IT as the basis — do not invent a different formula:\n"
+            + "\n".join(feasible_lines) + "\n"
+        )
+    else:
+        feasible_block = ""
+
+    # detect natural grouping columns
+    df_cols_for_grouping = [
+        col for col in df.columns
+        if df[col].dtype == object and 2 <= df[col].nunique() <= 100
+    ]
+    grouping_block = ""
+    if df_cols_for_grouping:
+        grouping_block = (
+            f"\nGROUPING COLUMNS DETECTED: {df_cols_for_grouping}\n"
+            "Consider generating per-group variants of numeric features using these columns.\n"
+            "Example: if 'country' has 50 unique values → "
+            "df['energy_consumption'].groupby(df['country']).transform('mean') "
+            "gives mean energy per country — more informative than a global stat.\n"
+        )
 
     completed_formulas = state.get("completed_formulas", [])
     failed_formulas    = state.get("failed_formulas", [])
@@ -52,13 +89,20 @@ def feature_planner(state: AgentState) -> dict:
 
 Given this CSV schema:
 {schema_str}
-{hint_block}{feasible_block}{blacklist_block}
+{hint_block}{feasible_block}{grouping_block}{blacklist_block}
 Generate between 1 and {max_f} new feature columns.
 For each feature return a FeaturePlan with:
 - feature_name: short snake_case column name
 - description: what it represents
 - pandas_code: a single Python *expression* using only `df` that returns a pandas Series.
   Do NOT import anything. Do NOT assign variables.
+  If a formula hint is provided above — USE IT. Do not substitute a different formula.
+
+MATH CORRECTNESS RULE:
+  The formula must compute exactly what the description says.
+  WRONG: description='energy per urban pop', code=df['energy'] / df['urban_pop'] * df['energy']
+  RIGHT: description='energy per urban pop', code=df['energy'] / df['urban_pop']
+  Before writing the formula, verify: does this expression produce the described quantity?
 
 GROUPBY RULE: if description says "per X", use groupby + transform.
   Example: "total sales per region" → df.groupby('region')['unit_price'].transform('sum')
@@ -73,12 +117,49 @@ APPLY vs TRANSFORM RULE (CRITICAL):
   RIGHT: df.groupby('x')['a'].transform('sum')                  → correct
   WRONG: df.groupby('x').apply(lambda x: (x['a']*x['b']).sum()) → NaN column
   RIGHT: (df['a'] * df['b']).groupby(df['x']).transform('sum')  → correct
+
+PD.CUT RULE: labels must be exactly len(bins) - 1.
+  bins=[a, b, c, d] → 3 intervals → labels must have 3 elements.
+  WRONG: bins=[-inf, 0, 15, 25, 35, +inf], labels=['a','b','c','d'] → 5 bins, 4 labels ← ERROR
+  RIGHT: bins=[-inf, 0, 15, 25, 35, +inf], labels=['a','b','c','d','e'] → 5 bins, 5 labels ✓
+  Always count: N bin edges → N-1 intervals → N-1 labels.
+
+DAILY DATE RULE: if date column contains daily data (no time component),
+  .dt.hour / .dt.minute / .dt.second will always be 0 — useless.
+  Use .dt.dayofweek, .dt.month, .dt.quarter, .dt.dayofyear instead.
+  Check sample values before choosing a date feature.
 """
     result   = planner_llm.invoke(prompt)
     features = result.features[:max_f]
 
+    # Build lookup: snake_case name → original description from feasible_features
+    # e.g. "total momentum of particles" → "total_momentum"
+    feasible_name_map: dict[str, str] = {}
+    for f_str in feasible_clean:
+        concept = f_str.split(" (")[0].split(":")[0].strip().lower().replace(" ", "_")
+        feasible_name_map[concept] = concept
+
+    objective      = state.get("objective", "")
+    original_cols  = state.get("original_columns", [])
+    # used_names = original CSV columns + already completed features
+    # → derive_feature_name will never return a name that collides with either
+    already_used   = list(original_cols) + list(state.get("completed_features", []))
+
     for f in features:
-        f.feature_name = derive_feature_name(f.pandas_code)
+        formula_lower = f.pandas_code.lower()
+        matched_name  = None
+        for concept in feasible_name_map:
+            concept_words = concept.replace("_", " ").split()
+            if any(w in formula_lower for w in concept_words if len(w) > 3):
+                if concept not in already_used:
+                    matched_name = concept
+                break
+
+        name = matched_name if matched_name else \
+            derive_feature_name(f.pandas_code, context=objective, used_names=already_used)
+
+        f.feature_name = name
+        already_used.append(name)
 
     print(f"[feature_planner] hint: {objective or '(none)'}")
     print(f"[feature_planner] Planned {len(features)} feature(s):")
@@ -103,6 +184,11 @@ def validate_plan(state: AgentState) -> dict:
     queue = state["feature_queue"]
     all_features = [plan.model_dump()] + queue
 
+    df              = path_to_df(state["df"])
+    existing_cols   = df.columns.tolist()
+    n_rows          = len(df)
+    low_card_thresh = max(10, n_rows // 100)   # e.g. 36540 rows → threshold = 365
+
     features_str = "\n".join(
         f"  {i+1}. {f['feature_name']}: {f['pandas_code']}"
         for i, f in enumerate(all_features)
@@ -122,18 +208,49 @@ Classification rule: classify by the GROUPING column, not the metric computed.
 
     prompt = f"""You are a feature engineering reviewer. For EACH feature, reason step by step.
 
-{hint_section}LEAKAGE RULES (always apply):
+{hint_section}TRIVIAL FEATURE RULE (always applies):
+  Reject any feature whose pandas_code is just df['column_name'] with no transformation.
+  Copying an existing column adds zero new information.
+
+NAME COLLISION RULE (always applies):
+  Reject any feature whose feature_name is identical to an existing column name.
+  Existing columns: {existing_cols}
+  The new feature must have a DIFFERENT name that reflects the transformation applied.
+
+MATH CORRECTNESS RULE (always applies):
+  The formula must compute exactly what the description says.
+  Read the description, then verify: does the expression produce that exact quantity?
+  WRONG: description='energy per urban pop', code=df['energy'] / df['urban_pop'] * df['energy']
+         → multiplies energy twice — not energy per urban pop → DROP
+  RIGHT: description='energy per urban pop', code=df['energy'] / df['urban_pop'] → correct ✓
+  WRONG: description='ratio of A to B', code=df['A'] * df['B'] → that is a product not a ratio
+  RIGHT: description='ratio of A to B', code=df['A'] / df['B'] → correct ✓
+  If the formula does not match the description → DROP with reason.
+
+LOW CARDINALITY RULE (always applies):
+  Reject features that produce very few unique values relative to dataset size ({n_rows} rows).
+  If a groupby transform produces <= {low_card_thresh} unique values for {n_rows} rows → DROP.
+  This indicates the feature has insufficient predictive variation.
+
   UNSAFE — drop:
-    shift(-N) with N > 0 → future rows
+    shift(-N) where N > 0 → FUTURE rows (NEGATIVE shift only)
+      shift(-1) → tomorrow → LEAKAGE
+      shift(-2) → 2 days ahead → LEAKAGE
     transform('max') or transform('last') on a DATE column
     df['date'].max() or df['date'].last() globally
     expanding() windows
 
   SAFE — keep:
-    transform('min') on date → first/earliest date per group → always past ✓
-    transform('mean/sum/count') on numeric → cross-sectional ✓
-    dt.dayofweek, dt.month, dt.day → current row only ✓
-    shift(1) or shift(+N) → previous rows ✓
+    shift(N) or shift(+N) where N > 0 → PAST rows → ALWAYS SAFE ✓
+      shift(1)  → yesterday → SAFE
+      shift(2)  → 2 days ago → SAFE
+      shift(7)  → last week → SAFE
+    CRITICAL: shift with POSITIVE number is NEVER leakage — it looks backward.
+    Only NEGATIVE shift (shift(-1), shift(-2)) is leakage.
+    rolling(window=N) → looks backward only → SAFE ✓
+    transform('min') on date → first/earliest date per group → SAFE ✓
+    transform('mean/sum/count') on numeric → cross-sectional → SAFE ✓
+    dt.dayofweek, dt.month, dt.day → current row only → SAFE ✓
 
 Features to review:
 {features_str}
@@ -159,6 +276,9 @@ For each feature fill in:
             print(f"  verdict    : {verdict_str.upper()} ✓")
 
         match = next((f for f in all_features if f["feature_name"] == v.feature_name), None)
+        if match is None:
+            print(f"  ⚠ WARNING: no match found for feature_name '{v.feature_name}' — "
+                  f"available names: {[f['feature_name'] for f in all_features]}")
         if match and verdict_str == "keep":
             kept.append(FeaturePlan(**match))
         elif match:

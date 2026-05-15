@@ -12,6 +12,7 @@ from feature_engineer.nodes.planning import feature_planner, validate_plan
 from feature_engineer.nodes.research import (
     extract_candidates, map_to_columns, research_features,
     research_tool_node, research_tools_condition,
+    evaluate_research, after_evaluate_research,
 )
 from feature_engineer.nodes.revision import revise_plan
 from feature_engineer.nodes.routing import (
@@ -30,6 +31,7 @@ def build_graph() -> StateGraph:
     g.add_node("research_features",  research_features)
     g.add_node("research_tools",     research_tool_node)
     g.add_node("extract_candidates", extract_candidates)
+    g.add_node("evaluate_research",  evaluate_research)
     g.add_node("map_to_columns",     map_to_columns)
     g.add_node("feature_planner",    feature_planner)
     g.add_node("validate_plan",      validate_plan)
@@ -45,7 +47,7 @@ def build_graph() -> StateGraph:
     g.add_edge(START,                "load_csv")
     g.add_edge("load_csv",           "research_features")
     g.add_edge("research_tools",     "research_features")
-    g.add_edge("extract_candidates", "map_to_columns")
+    g.add_edge("extract_candidates", "evaluate_research")   # evaluate before mapping
     g.add_edge("map_to_columns",     "feature_planner")
     g.add_edge("feature_planner",    "validate_plan")
     g.add_edge("validate_plan",      "validate_code")
@@ -60,9 +62,15 @@ def build_graph() -> StateGraph:
         {"tools": "research_tools", "done": "extract_candidates"},
     )
     g.add_conditional_edges(
+        "evaluate_research",
+        after_evaluate_research,
+        {"retry": "research_features", "continue": "map_to_columns"},
+    )
+    g.add_conditional_edges(
         "validate_code",
         should_execute,
-        {"run": "create_feature", "next": "next_feature", "save": "save_csv"},
+        {"run": "create_feature", "revise": "revise_plan",
+         "next": "next_feature",  "save": "save_csv"},
     )
     g.add_conditional_edges(
         "validate",

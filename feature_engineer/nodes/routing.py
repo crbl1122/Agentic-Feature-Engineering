@@ -97,11 +97,22 @@ def next_feature(state: AgentState) -> dict:
 # ── Pure routers ────────────────────────────────────────────────────────────────
 
 def should_execute(state: AgentState) -> str:
-    """Route after validate_code: run / next / save."""
-    if state["errors"]:
-        print(f"[router] AST blocked '{state['plan'].feature_name}' — skipping.")
-        return "next" if state["feature_queue"] else "save"
-    return "run"
+    """Route after validate_code.
+    'run'    → AST passed.
+    'revise' → SyntaxError — fixable, not dangerous.
+    'next'   → Security block — skip, no revision.
+    'save'   → Security block + queue empty.
+    """
+    if not state["errors"]:
+        return "run"
+
+    error = state["errors"][0]
+    if "Syntax error" in error:
+        print(f"[router] Syntax error in '{state['plan'].feature_name}' — routing to revise_plan.")
+        return "revise"
+
+    print(f"[router] AST blocked '{state['plan'].feature_name}' — skipping (unsafe code).")
+    return "next" if state["feature_queue"] else "save"
 
 
 def should_retry(state: AgentState) -> str:

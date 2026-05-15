@@ -153,7 +153,7 @@ def launch_ui() -> None:
                    theme=gr.themes.Soft()) as demo:
 
         gr.Markdown("""
-# Feature Engineering Agent
+# LangGraph Feature Engineering Agent
 Describe your ML objective, upload a CSV, and let the agent research,
 plan, generate and validate features automatically.
         """)
@@ -161,16 +161,25 @@ plan, generate and validate features automatically.
         with gr.Tabs():
 
             # ── Run ────────────────────────────────────────────────────────────
-            with gr.Tab("▶  Run"):
+            with gr.Tab("Run"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        csv_input  = gr.File(label="Upload CSV", file_types=[".csv"])
+                        csv_input  = gr.File(
+                            label="Upload CSV",
+                            file_types=[".csv"],
+                            file_count="single",
+                        )
+                        clear_btn = gr.ClearButton(
+                            components=[csv_input],
+                            value="Clear",
+                            size="sm",
+                        )
                         hint_input = gr.Textbox(
                             label="Objective",
                             placeholder="e.g. predict sales using location OR time based features only",
                             lines=2,
                         )
-                        run_btn             = gr.Button("▶  Run Agent", variant="primary")
+                        run_btn             = gr.Button("Run Agent", variant="primary")
                         max_features_slider = gr.Slider(
                             minimum=1, maximum=10, value=DEFAULT_MAX_FEATURES,
                             step=1, label="Max features to generate",
@@ -188,11 +197,11 @@ plan, generate and validate features automatically.
                     log_box = gr.Textbox(label="Agent Logs", lines=20, interactive=False)
 
             # ── History ────────────────────────────────────────────────────────
-            with gr.Tab("🕓  History"):
-                refresh_btn  = gr.Button("↻  Refresh", variant="secondary")
+            with gr.Tab("History"):
+                refresh_btn  = gr.Button("Refresh", variant="secondary")
                 history_html = gr.HTML(value=load_history_html())
 
-                gr.Markdown("### ⏩ Resume a failed run")
+                gr.Markdown("### Resume a failed run")
                 with gr.Row():
                     failed_dropdown = gr.Dropdown(
                         choices=load_failed_runs(),
@@ -200,7 +209,7 @@ plan, generate and validate features automatically.
                         info="Select a run to resume from its last checkpoint",
                         scale=4,
                     )
-                    resume_btn = gr.Button("⏩  Resume", variant="primary", scale=1)
+                    resume_btn = gr.Button("Resume", variant="primary", scale=1)
 
                 resume_logs     = gr.Textbox(label="Resume Logs",     lines=10, interactive=False)
                 resume_summary  = gr.Textbox(label="Feature Summary", lines=6,  interactive=False)

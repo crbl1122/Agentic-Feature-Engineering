@@ -19,6 +19,8 @@ _EVAL_NAMESPACE = {
     "float": float,
     "str": str,
     "bool": bool,
+    "isinstance": isinstance,   # needed for None-safe lambdas
+    "len": len,                  # needed for string length checks
 }
 
 
@@ -40,8 +42,15 @@ def create_feature(state: AgentState) -> dict:
     df   = path_to_df(state["df"]).copy()
     plan = state["plan"]
 
-    if plan.feature_name in df.columns:
-        df = df.drop(columns=[plan.feature_name])
+    # hard block — never overwrite an original column
+    original_cols = state.get("original_columns", [])
+    if plan.feature_name in original_cols:
+        err = (
+            f"Name collision: '{plan.feature_name}' is an original CSV column. "
+            f"Propose a different name that reflects the transformation applied."
+        )
+        print(f"[create_feature] Blocked: {err}")
+        return {"errors": [err], "attempts": state["attempts"] + 1}
 
     # auto-convert object columns that look like dates
     for col in df.columns:
@@ -83,6 +92,12 @@ def validate(state: AgentState) -> dict:
         actual_val = df[col].iloc[0]
         issues.append(
             f"'{col}' is constant (every value is {actual_val!r}) — zero variance."
+        )
+
+    if hasattr(df[col].dtype, 'name') and 'timedelta' in str(df[col].dtype):
+        issues.append(
+            f"'{col}' is timedelta64 — ML models need numeric. "
+            f"Use .dt.days // 365 to convert to integer years."
         )
 
     if issues:
