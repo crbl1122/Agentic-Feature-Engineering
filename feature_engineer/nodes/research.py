@@ -18,11 +18,31 @@ from feature_engineer.storage.parquet import path_to_df
 
 from langgraph.prebuilt import ToolNode
 
-MAX_RESEARCH_ATTEMPTS = 2
+MAX_RESEARCH_ATTEMPTS = 1
 
 _research_llm_forced = research_base_llm.bind_tools([serper_tool], tool_choice="required")
 _research_llm_auto   = research_base_llm.bind_tools([serper_tool])
 research_tool_node   = ToolNode(tools=[serper_tool], messages_key="research_messages")
+
+
+def _expand_queries(objective: str, domain_hint: str, n: int = 3) -> list[str]:
+    """Generate n diverse search queries for the same domain using LLM."""
+    prompt = (
+        f"Generate {n} different search queries to find relevant notebooks, papers or tutorials.\n\n"
+        f"Domain: {domain_hint}\n"
+        f"Objective: {objective[:300]}\n\n"
+        f"Rules:\n"
+        f"- Keep queries SHORT: 4-6 words\n"
+        f"- Use the most specific domain keywords (dataset name, disease, technique)\n"
+        f"- Each query must use a different angle:\n"
+        f"  1. dataset name + feature engineering\n"
+        f"  2. dataset name + EDA or data analysis\n"
+        f"  3. dataset name + prediction or machine learning\n"
+        f"- Return only the {n} queries, one per line, no numbering or explanation"
+    )
+    response = llm.invoke(prompt)
+    queries  = [q.strip() for q in response.content.strip().splitlines() if q.strip()]
+    return queries[:n]
 
 
 def research_features(state: AgentState) -> dict:
@@ -57,13 +77,12 @@ def research_features(state: AgentState) -> dict:
             "CHAIN OF THOUGHT — follow these steps:\n"
             "  Step 1: Extract the ML domain from the objective.\n"
             "  Step 2: Review the available column names and types.\n"
-            "  Step 3: Search for feature engineering best practices 2-3 times "
-            "using site:kaggle.com queries.\n"
+            "  Step 3: Search for feature engineering best practices 2-3 times.\n"
             "  Step 4: Synthesise a curated list of specific, computable features "
             "with formula hints based on the ACTUAL columns available.\n\n"
             "SEARCH RULES:\n"
-            "  - Prefix queries with 'site:kaggle.com'\n"
             "  - Make 2-3 searches with different angles\n"
+            "  - Search for notebooks, papers, or tutorials relevant to the domain\n"
             "  - Focus on features that use the ACTUAL columns listed below\n\n"
             "OUTPUT: after searching, produce a structured list of features.\n"
             "Each feature must have a name, description, and formula_hint "
@@ -71,37 +90,35 @@ def research_features(state: AgentState) -> dict:
             f"{columns_info}"
         ))
 
-        if research_feedback:
-            domain_hint  = objective.split("\n")[0][:80]
-            search_query = f"site:kaggle.com {domain_hint} feature engineering pandas"
-            human = HumanMessage(content=(
-                f"Objective:\n{objective}\n\n"
-                f"FEEDBACK FROM PREVIOUS ATTEMPT:\n{research_feedback}\n\n"
-                f"Search again with a different angle.\n"
-                f"Suggested query: '{search_query}'\n"
-                "Find features with concrete pandas formula hints "
-                "using the available columns."
-            ))
-        else:
-            domain_hint  = objective.split("\n")[0][:80]
-            search_query = f"site:kaggle.com {domain_hint} feature engineering pandas"
-            human = HumanMessage(content=(
-                f"Objective:\n{objective}\n\n"
-                "Follow the chain-of-thought steps:\n"
-                "  1. Extract the domain.\n"
-                "  2. Review the available columns.\n"
-                f"  3. Search: start with '{search_query}'\n"
-                "  4. Make 2-3 searches, then produce the structured feature list."
-            ))
+        queries     = _expand_queries(objective, domain_hint, n=3)
+        queries_str = "\n".join(f"  - {q}" for q in queries)
+        print(f"[research_features] Expanded queries:\n{queries_str}")
+        human = HumanMessage(content=(
+            f"Objective:\n{objective}\n\n"
+            "Follow the chain-of-thought steps:\n"
+            "  1. Extract the domain.\n"
+            "  2. Review the available columns.\n"
+            f"  3. Search using these queries (use each one):\n{queries_str}\n"
+            "  4. After all searches, produce the structured feature list."
+        ))
 
-        messages = [system, human]
+        messages          = [system, human]
+        is_first_or_retry = True
     else:
-        messages = existing
+        messages          = existing
+        is_first_or_retry = False
 
-    is_first_or_retry = not existing
-    research_llm      = _research_llm_forced if is_first_or_retry else _research_llm_auto
+    research_llm = _research_llm_forced if is_first_or_retry else _research_llm_auto
 
     response = research_llm.invoke(messages)
+
+    # log what the LLM actually searched for
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        for tc in response.tool_calls:
+            query = tc.get("args", {}).get("query", "")
+            if query:
+                print(f"[research] LLM searched: {query}")
+
     return {"research_messages": [response]}
 
 
@@ -122,6 +139,33 @@ def extract_candidates(state: AgentState) -> dict:
     if not messages:
         return {"feature_candidates": [], "research_formula_hints": {}}
 
+    # log Serper queries and result titles for debugging
+    for msg in messages:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                query = tc.get("args", {}).get("query", "")
+                if query:
+                    print(f"[research] Serper query: {query}")
+        # ToolMessage has type="tool" — check content for Serper results
+        if hasattr(msg, "type") and msg.type == "tool":
+            raw = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if raw.strip():
+                lines = raw.splitlines()
+                print(f"[research] Serper results:")
+                i = 0
+                count = 0
+                while i < len(lines) and count < 6:
+                    line = lines[i].strip()
+                    if line and not line.startswith("URL:"):
+                        url = ""
+                        if i + 1 < len(lines) and lines[i+1].strip().startswith("URL:"):
+                            url = lines[i+1].strip()[4:].strip()
+                        print(f"  • {line[:100]}")
+                        if url:
+                            print(f"    {url}")
+                        count += 1
+                    i += 1
+
     # build context from all messages for the synthesis call
     conversation = []
     for msg in messages:
@@ -136,18 +180,36 @@ def extract_candidates(state: AgentState) -> dict:
     columns_info = f"Available columns: {df.columns.tolist()}" if df is not None else ""
     objective    = state.get("objective", "")
 
+    target_cols  = state.get("target_columns", [])
+    target_note  = ""
+    if target_cols:
+        target_note = (
+            f"\nNEVER extract candidates that use these TARGET COLUMNS: {target_cols}\n"
+            "These are prediction targets — features derived from them cause leakage.\n"
+        )
+
     prompt = (
         f"Based on this research:\n\n{context}\n\n"
         f"Objective: {objective}\n"
-        f"{columns_info}\n\n"
-        "Extract a curated list of specific, computable feature candidates.\n"
+        f"{columns_info}\n"
+        f"{target_note}\n"
+        "Extract a curated list of 8-10 specific, computable feature candidates.\n"
+        "If the research context is limited, use your domain knowledge to propose additional "
+        "relevant features based on the available columns.\n"
         "Each feature must:\n"
-        "  1. Be a concrete transformation (ratio, lag, bin, interaction, rolling)\n"
+        "  1. Be a concrete transformation with a clear pandas formula\n"
         "  2. Be relevant to the objective domain\n"
         "  3. Use columns that actually exist in the dataset\n"
         "  4. Have a formula_hint you could turn into a pandas expression\n\n"
-        "Do NOT include vague concepts like 'historical data' or 'weather conditions'.\n"
-        "Do NOT include methodology names like 'feature selection' or 'normalization'."
+        "PREFER features that achieve one of these goals:\n"
+        "  - Add meaningful interactions (combine 2+ columns to capture joint effects)\n"
+        "  - Summarize cohort structure (count, frequency, or ratio per group)\n"
+        "  - Improve separability (encode categories that distinguish the target)\n"
+        "  - Inject prior statistical information safely (without using target columns)\n\n"
+        "AVOID: simple binary encodings of a single existing column "
+        "(e.g. Y→1/N→0 is trivial if the column already exists as Y/N).\n"
+        "AVOID: methodology names like 'feature selection' or 'normalization'.\n"
+        "AVOID: features with no transformation beyond dtype casting."
     )
 
     result: ResearchFeatureList = research_structured_llm.invoke(prompt)
@@ -199,14 +261,23 @@ def evaluate_research(state: AgentState) -> dict:
 
     df           = path_to_df(state["df"])
     column_names = df.columns.tolist()
+    target_cols    = state.get("target_columns", [])
     candidates_str = "\n".join(f"  - {c}" for c in new_candidates)
+
+    target_block = ""
+    if target_cols:
+        target_block = (
+            f"TARGET COLUMNS — these are prediction targets, NEVER use them in features: {target_cols}\n"
+            "Reject any candidate that uses a target column directly or indirectly "
+            "(binning, groupby, ratio, etc.).\n\n"
+        )
 
     prompt = f"""You are a feature engineering quality reviewer.
 
 Objective:
 {objective}
 
-Available columns: {column_names}
+{target_block}Available columns: {column_names}
 
 New feature candidates to evaluate:
 {candidates_str}
@@ -214,18 +285,23 @@ New feature candidates to evaluate:
 For EACH candidate classify as specific (ACCEPT) or generic (REJECT):
 
 ACCEPT — specific and computable:
-  - Names a concrete transformation: ratio, lag, bin, rolling, interaction, count, flag
+  - Names a concrete transformation: ratio, lag, bin, rolling, interaction, count, combination
   - You could write a pandas expression for it without guessing
   - Relevant to the domain described in the objective
   - NOT identical to an existing column (renaming/retyping)
+  - Combines 2+ columns OR applies a non-trivial transformation to 1 column
   NOTE: lag/shift/rolling of existing columns are ALWAYS ACCEPT ✓
 
-REJECT — generic or vague or off-domain:
+REJECT — generic, vague, off-domain, or trivially simple:
   REJECT_GENERIC: methodology name, process name, category name
   REJECT_VAGUE: names a concept but which transformation is unclear
     Signs: "historical X", "X factors", "X conditions", "X patterns"
-  REJECT_OFFOMAIN: clearly belongs to a different domain than the objective
+  REJECT_OFFDOMAIN: clearly belongs to a different domain than the objective
   REJECT_IDENTICAL: same concept as an existing column with no new computation
+  REJECT_TRIVIAL: simple binary encoding of a SINGLE existing column — adds no new information
+    e.g. "cna_flag: map Y→1, N→0" when CNA already exists → trivial dtype cast
+    e.g. "gene_expression_numeric: Y→1, N→0" → trivial, no combination or interaction
+    EXCEPTION: binary encoding is ACCEPT if combined with another column or used in interaction
 
 Fill the reasons dict with the rejection reason for each generic candidate.
 """
@@ -258,21 +334,12 @@ Fill the reasons dict with the rejection reason for each generic candidate.
             "research_messages":    [],
         }
 
-    feedback = (
-        f"These {n_rejected} candidates were rejected:\n"
-        + "\n".join(f"  - {r}: {reasons.get(r, '')}" for r in rejected)
-        + f"\n\nSearch again to find {n_rejected} SPECIFIC replacement features "
-        f"for the domain: {objective.split(chr(10))[0][:80]}\n"
-        "Each replacement must name a concrete transformation — "
-        "something you could write a pandas expression for without guessing.\n"
-        "Do NOT return vague names like 'historical X data' or 'X factors'."
-    )
-
+    # MAX_RESEARCH_ATTEMPTS=1 so we never reach here, but kept for safety
     return {
         "research_attempts":    attempts,
-        "research_is_specific": False,
+        "research_is_specific": True,
         "good_candidates":      good_candidates,
-        "research_feedback":    feedback,
+        "research_feedback":    "",
         "research_messages":    [],
     }
 

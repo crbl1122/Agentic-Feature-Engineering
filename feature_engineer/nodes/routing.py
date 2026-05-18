@@ -2,13 +2,76 @@
 Routing nodes and pure router functions.
 next_feature and save_csv live here alongside the conditional edge functions.
 """
+import json
 import os
 
 import pandas as pd
 
 from feature_engineer.config import OUTPUT_DIR
+from feature_engineer.llm.setup import llm
 from feature_engineer.state import AgentState, FeaturePlan
 from feature_engineer.storage.parquet import path_to_df
+
+
+# ── generate_recommendations ─────────────────────────────────────────────────────
+
+def generate_recommendations(state: AgentState) -> dict:
+    """Generate top-5 recommended features from research context that need additional data."""
+    messages        = state.get("research_messages", [])
+    objective       = state.get("objective", "")
+    completed       = state.get("completed_features", [])
+    original_cols   = state.get("original_columns", [])
+
+    # build context from Serper results
+    context_lines = []
+    for msg in messages:
+        if hasattr(msg, "type") and msg.type == "tool":
+            raw = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if raw.strip():
+                context_lines.append(raw[:500])
+    context = "\n\n".join(context_lines[:6])
+
+    if not context:
+        return {"feature_recommendations": []}
+
+    prompt = f"""You are a feature engineering expert in pharmacogenomics.
+
+Objective: {objective[:300]}
+
+Available columns: {original_cols}
+
+Features already generated: {completed}
+
+Research context (from literature):
+{context}
+
+Based on this literature, identify the TOP 5 most important features that:
+1. Would be highly predictive for the objective
+2. CANNOT be computed from the available columns above
+3. Would require additional data (specify what data)
+
+Return a JSON array with exactly 5 objects, each with:
+- "name": short feature name
+- "description": biological rationale (1-2 sentences)
+- "required_data": what additional data would be needed
+- "example_formula": example pandas formula if data were available
+
+Return ONLY the JSON array, no other text."""
+
+    try:
+        response = llm.invoke(prompt)
+        raw      = response.content.strip()
+        # strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        recommendations = json.loads(raw.strip())
+        print(f"[recommendations] Generated {len(recommendations)} feature recommendations")
+        return {"feature_recommendations": recommendations[:5]}
+    except Exception as e:
+        print(f"[recommendations] Error: {e}")
+        return {"feature_recommendations": []}
 
 
 # ── save_csv ────────────────────────────────────────────────────────────────────
@@ -27,7 +90,7 @@ def save_csv(state: AgentState) -> dict:
     print(f"  output_path        : {state['output_path']}")
     print(f"  objective          : {state['objective']!r}")
     print(f"  max_features       : {state.get('max_features', 3)}")
-    print(f"  attempts           : {state['attempts']}")
+    print(f"  attempts           : {state.get('attempts', 0)}")
     print(f"  errors             : {state['errors']}")
     print(f"  completed_features : {completed}")
     print(f"  df.shape           : {df.shape}")
@@ -117,8 +180,8 @@ def should_execute(state: AgentState) -> str:
 
 def should_retry(state: AgentState) -> str:
     """Route after validate: revise / record / next / save."""
-    if state["errors"] and state["attempts"] < 3:
-        print(f"[router] Errors detected → revise_plan (attempt {state['attempts']}/3)")
+    if state["errors"] and state.get("attempts", 0) < 3:
+        print(f"[router] Errors detected → revise_plan (attempt {state.get('attempts', 0)}/3)")
         return "revise"
     if state["errors"]:
         print(f"[router] Exhausted retries for '{state['plan'].feature_name}' — skipping.")

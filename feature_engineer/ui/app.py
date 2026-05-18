@@ -19,7 +19,7 @@ from feature_engineer.ui.history import load_history_html
 
 # ── Async streaming agent ───────────────────────────────────────────────────────
 
-async def run_agent(csv_file, objective: str, max_features: int):
+async def run_agent(csv_file, objective: str, max_features: int, exclude_columns: str = ""):
     """Async streaming generator — yields log updates as the agent runs."""
     import gradio as gr
 
@@ -38,11 +38,20 @@ async def run_agent(csv_file, objective: str, max_features: int):
         "recursion_limit": DEFAULT_RECURSION_LIMIT,
     }
 
+    # parse exclude_columns — one per line or comma-separated
+    target_cols = []
+    if exclude_columns and exclude_columns.strip():
+        for part in exclude_columns.replace(",", "\n").splitlines():
+            col = part.strip().strip("-").strip()
+            if col:
+                target_cols.append(col)
+
     initial_state = empty_state(
         input_path=input_path,
         output_path=output_path,
         objective=objective.strip(),
         max_features=int(max_features),
+        target_columns=target_cols,
     )
 
     logs        = ""
@@ -88,21 +97,46 @@ async def run_agent(csv_file, objective: str, max_features: int):
     finally:
         sys.stdout = old_stdout
 
-    completed = final_state.get("completed_features", [])
-    df_out    = pd.read_csv(output_path) if os.path.exists(output_path) else pd.DataFrame()
+    completed       = final_state.get("completed_features", [])
+    recommendations = final_state.get("feature_recommendations", [])
+    df_out          = pd.read_csv(output_path) if os.path.exists(output_path) else pd.DataFrame()
     save_run(thread_id, final_state, status)
 
     summary = (
         f"Thread ID          : {thread_id}\n"
         f"Features completed : {len(completed)} → {completed}\n"
         f"Status             : {status}\n"
-        f"Output shape       : {df_out.shape[0]} rows × {df_out.shape[1]} cols"
+        f"Output shape       : {df_out.shape[0]} rows × {df_out.shape[1]} cols\n"
     )
+    if recommendations:
+        summary += "\n── Recommended features (require additional data) ──────────\n"
+        for i, rec in enumerate(recommendations, 1):
+            summary += (
+                f"\n{i}. {rec.get('name', '')}\n"
+                f"   {rec.get('description', '')}\n"
+                f"   Needs: {rec.get('required_data', '')}\n"
+            )
+
     yield logs, summary, df_out.head(20), output_path, load_history_html()
 
 
+def _format_recommendations(recommendations: list[dict]) -> str:
+    """Format recommendations as HTML for Gradio."""
+    if not recommendations:
+        return "<p style='color:gray'>No recommendations generated yet. Run the agent first.</p>"
+    html = "<h3>Top 5 Recommended Features (require additional data)</h3>"
+    for i, rec in enumerate(recommendations, 1):
+        html += f"""
+        <div style='border:1px solid #ddd; border-radius:8px; padding:12px; margin:8px 0'>
+            <b>{i}. {rec.get('name', '')}</b><br>
+            <span style='color:#555'>{rec.get('description', '')}</span><br><br>
+            <b>Required data:</b> {rec.get('required_data', '')}<br>
+            <b>Example formula:</b> <code>{rec.get('example_formula', '')}</code>
+        </div>"""
+    return html
+
+
 async def resume_run(thread_id: str):
-    """Resume an incomplete run from its last checkpoint."""
     import gradio as gr
 
     if not thread_id or not thread_id.strip():
@@ -179,6 +213,11 @@ plan, generate and validate features automatically.
                             placeholder="e.g. predict sales using location OR time based features only",
                             lines=2,
                         )
+                        exclude_input = gr.Textbox(
+                            label="Exclude columns (one per line, leave empty to use all)",
+                            placeholder="e.g.\nLN_IC50\nAUC\nZ_SCORE",
+                            lines=3,
+                        )
                         run_btn             = gr.Button("Run Agent", variant="primary")
                         max_features_slider = gr.Slider(
                             minimum=1, maximum=10, value=DEFAULT_MAX_FEATURES,
@@ -238,7 +277,7 @@ plan, generate and validate features automatically.
 
         run_btn.click(
             fn=run_agent,
-            inputs=[csv_input, hint_input, max_features_slider],
+            inputs=[csv_input, hint_input, max_features_slider, exclude_input],
             outputs=[log_box, summary_box, preview_table, download_btn, history_html],
         )
 

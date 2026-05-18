@@ -15,12 +15,13 @@ from feature_engineer.storage.parquet import init_dirs
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LangGraph feature engineering agent")
-    parser.add_argument("--input",        default="",  help="Path to input CSV")
-    parser.add_argument("--output",       default="",  help="Path to write enriched CSV")
-    parser.add_argument("--objective",    default="",  help="ML objective and feature constraints")
-    parser.add_argument("--max-features", default=DEFAULT_MAX_FEATURES, type=int)
-    parser.add_argument("--thread-id",    default="",  help="Resume a specific checkpoint")
-    parser.add_argument("--ui",           action="store_true", help="Launch Gradio UI")
+    parser.add_argument("--input",           default="",  help="Path to input CSV")
+    parser.add_argument("--output",          default="",  help="Path to write enriched CSV")
+    parser.add_argument("--objective",       default="",  help="ML objective and feature constraints")
+    parser.add_argument("--max-features",    default=DEFAULT_MAX_FEATURES, type=int)
+    parser.add_argument("--thread-id",       default="",  help="Resume a specific checkpoint")
+    parser.add_argument("--exclude-columns", default="",  help="Comma-separated columns to exclude from features (e.g. 'LN_IC50,AUC')")
+    parser.add_argument("--ui",              action="store_true", help="Launch Gradio UI")
     args = parser.parse_args()
 
     if args.ui:
@@ -47,11 +48,13 @@ async def _run_cli(args) -> None:
     }
     print(f"[main] thread_id: {thread_id}")
 
+    target_cols   = [c.strip() for c in args.exclude_columns.split(",") if c.strip()] if args.exclude_columns else []
     initial_state = empty_state(
         input_path=args.input,
         output_path=args.output,
         objective=args.objective,
         max_features=args.max_features,
+        target_columns=target_cols,
     )
 
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as checkpointer:

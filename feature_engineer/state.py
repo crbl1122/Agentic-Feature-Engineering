@@ -118,6 +118,14 @@ class VerdictList(BaseModel):
 
 # ── LangGraph state ─────────────────────────────────────────────────────────────
 
+def _research_messages_reducer(current: list, update: list) -> list:
+    """Custom reducer for research_messages that supports reset via empty list sentinel."""
+    # if update is exactly [None], treat as reset signal
+    if update == [None]:
+        return []
+    return add_messages(current, update)
+
+
 class AgentState(TypedDict):
     input_path:          str
     output_path:         str
@@ -125,23 +133,25 @@ class AgentState(TypedDict):
     max_features:        int
     df:                  str
     original_columns:    list[str]
+    column_schema:       dict                                          # auto-built by schema_analyzer
+    target_columns:      list[str]                                     # columns to never use in features
     plan:                FeaturePlan | None
     feature_queue:       list[dict]
     feature_candidates:  list[str]
     feasible_features:   list[str]
-    ranked_features:     list[str]                                    # feasible features ranked by predictive value
+    ranked_features:     list[str]
     good_candidates:     list[str]
-    research_formula_hints: dict                                      # {feature_label: formula_hint}
-    research_messages:   Annotated[list, add_messages]
+    research_formula_hints: dict
+    research_messages:   Annotated[list, _research_messages_reducer]
     research_attempts:   int
     research_feedback:   str
-    research_is_specific: bool                                        # evaluator verdict
+    research_is_specific: bool
     completed_features:  Annotated[list[str],  lambda a, b: a + b]
     completed_plans:     Annotated[list[dict], lambda a, b: a + b]
     completed_formulas:  Annotated[list[str],  lambda a, b: a + b]
     failed_formulas:     Annotated[list[str],  lambda a, b: a + b]
     errors:              Annotated[list[str],  lambda a, b: b]
-    attempts:            int
+    feature_recommendations: list[dict]                                   # top-5 recommended features from literature
 
 
 def empty_state(
@@ -149,6 +159,7 @@ def empty_state(
     output_path: str,
     objective: str,
     max_features: int,
+    target_columns: list[str] | None = None,
 ) -> AgentState:
     """Return a fully initialised AgentState ready to invoke."""
     return AgentState(
@@ -158,6 +169,8 @@ def empty_state(
         max_features=max_features,
         df="",
         original_columns=[],
+        column_schema={},
+        target_columns=target_columns or [],
         plan=None,
         feature_queue=[],
         feature_candidates=[],
@@ -175,4 +188,5 @@ def empty_state(
         failed_formulas=[],
         errors=[],
         attempts=0,
+        feature_recommendations=[],
     )

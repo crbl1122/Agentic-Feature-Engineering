@@ -29,35 +29,38 @@ def revise_plan(state: AgentState) -> dict:
         print(f"[revise_plan]   Available columns: {df.columns.tolist()}")
 
     # schema with group sizes + special detail for referenced columns
+    schema      = state.get("column_schema", {})
+    target_cols = state.get("target_columns", [])
+
+    # only show detailed info for referenced columns — avoid LengthFinishReasonError
     schema_lines = []
     for col in df.columns:
         if col == plan.feature_name:
             continue
-        dtype  = df[col].dtype
-        counts = df[col].value_counts()
         if col in referenced_cols:
-            # show more detail for columns used in the failing formula
-            sample       = df[col].dropna().head(10).tolist()
-            has_non_num  = df[col].apply(lambda x: not str(x).replace('.','').replace('-','').isdigit()).any()
-            non_num_vals = df[col][df[col].apply(lambda x: not str(x).replace('.','').replace('-','').isdigit())].unique()[:5].tolist() if has_non_num else []
-            schema_lines.append(
-                f"  {col!r}: dtype={dtype}, sample={sample}"
-                + (f", ⚠ NON-NUMERIC VALUES: {non_num_vals}" if non_num_vals else "")
-            )
+            sem    = schema.get(col, {}).get("semantic_type", str(df[col].dtype))
+            exact  = schema.get(col, {}).get("exact_values", [])
+            sample = df[col].dropna().head(10).tolist()
+            non_num_vals = []
+            if df[col].dtype == object:
+                non_num_vals = [
+                    v for v in df[col].dropna().unique()[:5].tolist()
+                    if not str(v).replace('.','').replace('-','').lstrip('-').isdigit()
+                ]
             if non_num_vals:
                 print(f"[revise_plan] ⚠ Column '{col}' has non-numeric values: {non_num_vals}")
-        elif df[col].nunique() <= 20:
-            unique_vals = df[col].dropna().unique().tolist()
-            min_c = int(counts.min()) if len(counts) > 0 else 0
-            max_c = int(counts.max()) if len(counts) > 0 else 0
-            schema_lines.append(
-                f"  {col!r}: dtype={dtype}, unique values={unique_vals}, "
-                f"rows per value: min={min_c} max={max_c}"
-            )
+            detail = f"semantic={sem}, sample={sample[:5]}"
+            if exact:
+                detail += f", exact_values={exact[:8]}"
+            if non_num_vals:
+                detail += f", ⚠ NON-NUMERIC: {non_num_vals}"
+            schema_lines.append(f"  {col!r}: {detail}")
         else:
-            schema_lines.append(
-                f"  {col!r}: dtype={dtype}, sample={df[col].dropna().head(3).tolist()}"
-            )
+            # brief entry only
+            sem = schema.get(col, {}).get("semantic_type", str(df[col].dtype))
+            is_target = schema.get(col, {}).get("is_target", col in target_cols)
+            target_note = " [TARGET — do not use]" if is_target else ""
+            schema_lines.append(f"  {col!r}: {sem}{target_note}")
 
     # determine action based on error type — priority order matters
     objective = state.get("objective", "")
@@ -167,18 +170,22 @@ Return a corrected FeaturePlan. feature_name will be derived from the formula au
     # deterministic guard — reject if LLM proposed an already used formula
     all_used = set(completed_formulas) | set(all_failed)
     if revised.pandas_code in all_used:
+        current_attempts = state.get("attempts", 0) + 1
         print(f"[revise_plan] LLM proposed duplicate formula — rejecting: {revised.pandas_code}")
+        # if we've hit 3 attempts with only duplicates, force skip
+        if current_attempts >= 3:
+            print(f"[revise_plan] Max attempts reached with only duplicates — skipping feature")
         return {
             "errors":          [f"Duplicate formula proposed: {revised.pandas_code}"],
-            "attempts":        state["attempts"] + 1,
+            "attempts":        current_attempts,
             "failed_formulas": [plan.pandas_code],
         }
 
-    print(f"[revise_plan] Attempt {state['attempts'] + 1}/3 — "
+    print(f"[revise_plan] Attempt {state.get('attempts', 0) + 1}/3 — "
           f"name: {revised.feature_name} code: {revised.pandas_code}")
     return {
         "plan":            revised,
         "errors":          [],
-        "attempts":        state["attempts"] + 1,
+        "attempts":        state.get("attempts", 0) + 1,
         "failed_formulas": [plan.pandas_code],
     }

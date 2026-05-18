@@ -12,9 +12,11 @@ def feature_planner(state: AgentState) -> dict:
     df    = path_to_df(state["df"])
     max_f = state.get("max_features", 3)
 
+    target_cols_set = set(state.get("target_columns", []))
     schema_lines = [
         f"  {col!r}: dtype={df[col].dtype}, sample={df[col].dropna().head(3).tolist()}"
         for col in df.columns
+        if col not in target_cols_set
     ]
     schema_str = "\n".join(schema_lines)
 
@@ -71,7 +73,20 @@ def feature_planner(state: AgentState) -> dict:
             "gives mean energy per country — more informative than a global stat.\n"
         )
 
+    from feature_engineer.nodes.schema_analyzer import format_schema_for_prompt
+    schema       = state.get("column_schema", {})
+    target_cols  = state.get("target_columns", [])
+    schema_block = ""
+    if schema:
+        schema_block = "\n" + format_schema_for_prompt(schema) + "\n"
+    target_block = ""
+    if target_cols:
+        target_block = (
+            f"\nTARGET COLUMNS — never use in any feature: {target_cols}\n"
+        )
+
     completed_formulas = state.get("completed_formulas", [])
+    failed_formulas    = state.get("failed_formulas", [])
     failed_formulas    = state.get("failed_formulas", [])
 
     # detect feature types in feasible_clean for diversity enforcement
@@ -110,7 +125,7 @@ def feature_planner(state: AgentState) -> dict:
 
 Given this CSV schema:
 {schema_str}
-{hint_block}{feasible_block}{grouping_block}{diversity_block}{blacklist_block}
+{schema_block}{target_block}{hint_block}{feasible_block}{grouping_block}{diversity_block}{blacklist_block}
 Generate between 1 and {max_f} new feature columns.
 For each feature return a FeaturePlan with:
 - feature_name: short snake_case column name
@@ -191,6 +206,18 @@ DAILY DATE RULE: if date column contains daily data (no time component),
         already_used.append(name)
 
     print(f"[feature_planner] hint: {objective or '(none)'}")
+
+    # deduplicate by pandas_code before queueing
+    seen_codes = set()
+    unique_features = []
+    for f in features:
+        if f.pandas_code not in seen_codes:
+            seen_codes.add(f.pandas_code)
+            unique_features.append(f)
+        else:
+            print(f"[feature_planner] Duplicate formula removed: {f.feature_name} ({f.pandas_code})")
+    features = unique_features
+
     print(f"[feature_planner] Planned {len(features)} feature(s):")
     for f in features:
         print(f"  • {f.feature_name}: {f.pandas_code}")
@@ -215,6 +242,8 @@ def validate_plan(state: AgentState) -> dict:
 
     df              = path_to_df(state["df"])
     existing_cols   = df.columns.tolist()
+    schema          = state.get("column_schema", {})
+    target_cols     = state.get("target_columns", [])
     n_rows          = len(df)
     low_card_thresh = max(10, n_rows // 100)   # e.g. 36540 rows → threshold = 365
 
@@ -256,7 +285,17 @@ MATH CORRECTNESS RULE (always applies):
   RIGHT: description='ratio of A to B', code=df['A'] / df['B'] → correct ✓
   If the formula does not match the description → DROP with reason.
 
-LOW CARDINALITY RULE (always applies):
+HIGH CARDINALITY STRING RULE (always applies):
+  String concatenation of high-cardinality columns produces features too sparse for ML.
+  If formula is a string concatenation (col1 + '_' + col2):
+    - If ALL concatenated columns have < 50 unique values → KEEP
+    - If ANY concatenated column has >= 50 unique values → DROP
+  Examples:
+    msi (2 unique) + growth (3 unique) → 6 max combinations → KEEP ✓
+    cna (2) + gene_expression (2) → 4 combinations → KEEP ✓
+    target (185 unique) + tissue (19 unique) → too many → DROP
+    drug_name (286) + tissue (19) → too many → DROP
+
   Reject features that produce very few unique values relative to dataset size ({n_rows} rows).
   If a groupby transform produces <= {low_card_thresh} unique values for {n_rows} rows → DROP.
   This indicates the feature has insufficient predictive variation.
@@ -305,7 +344,54 @@ For each feature fill in:
 
         match = feature_map.get(v.feature_name)
 
-        # deterministic override: shift(+N) is ALWAYS safe — never leakage
+        # DETERMINISTIC: target leakage — simple substring check
+        if match:
+            code         = match.get("pandas_code", "")
+            used_targets = [c for c in target_cols if c in code]
+            if used_targets:
+                reason = f"Target leakage: formula contains target column(s) {used_targets}"
+                print(f"  verdict    : OVERRIDE → DROP ← {reason}")
+                dropped.append(f"{v.feature_name}: {reason}")
+                continue
+
+        # DETERMINISTIC: high cardinality string concat check
+        # override LLM verdict based on actual cardinality from column_schema
+        if match:
+            code = match.get("pandas_code", "")
+            import re as _re
+            is_concat = " + '_' + " in code or "+'_'+" in code
+            if is_concat:
+                cols_in_concat = _re.findall(r"df\['([^']+)'\]", code)
+                cardinalities  = [schema.get(c, {}).get("unique", 9999) for c in cols_in_concat]
+                product_card   = 1
+                for c in cardinalities:
+                    product_card *= c
+                threshold = max(100, n_rows // 100)
+                if product_card <= threshold and verdict_str == "drop" and "cardinality" in (v.drop_reason or "").lower():
+                    print(f"  verdict    : OVERRIDE → KEEP ✓ "
+                          f"(product cardinality {product_card} ≤ {threshold}: "
+                          f"{list(zip(cols_in_concat, cardinalities))})")
+                    kept.append(FeaturePlan(**match))
+                    continue
+                elif product_card > threshold and verdict_str == "keep":
+                    reason = (f"High cardinality concat: product={product_card} > threshold={threshold} "
+                              f"(cols: {list(zip(cols_in_concat, cardinalities))})")
+                    print(f"  verdict    : OVERRIDE → DROP ← {reason}")
+                    dropped.append(f"{v.feature_name}: {reason}")
+                    continue
+        if verdict_str == "drop" and "low cardinality" in (v.drop_reason or "").lower():
+            code = match.get("pandas_code", "") if match else ""
+            # cohort statistics are valid even with few unique values
+            cohort_patterns = [
+                "nunique", "transform('mean')", "transform(\"mean\")",
+                "transform('sum')", "transform(\"sum\")",
+                "transform('count')", "transform(\"count\")",
+                ".eq('Y')", '.eq("Y")', "value_counts",
+            ]
+            if any(p in code for p in cohort_patterns):
+                print(f"  verdict    : OVERRIDE → KEEP ✓ (cohort statistic — low cardinality is expected)")
+                kept.append(FeaturePlan(**match))
+                continue
         if match and verdict_str == "drop" and "shift" in v.drop_reason.lower():
             code = match.get("pandas_code", "")
             import re as _re
