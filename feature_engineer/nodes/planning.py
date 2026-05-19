@@ -45,7 +45,11 @@ def feature_planner(state: AgentState) -> dict:
         feasible_lines = []
         for f in feasible_clean:
             name = f.split(":")[0].strip()
-            hint = formula_hints.get(f, formula_hints.get(name, ""))
+            hint = next(
+                (v for k, v in formula_hints.items()
+                if k.split(":")[0].strip().lower().replace(" ", "_") == name),
+                ""
+            )
             if hint:
                 feasible_lines.append(f"  - {f}  →  USE THIS FORMULA: {hint}")
             else:

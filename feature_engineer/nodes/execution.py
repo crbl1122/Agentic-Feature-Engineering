@@ -293,6 +293,17 @@ def validate(state: AgentState) -> dict:
             f"'{col}' is constant (every value is {actual_val!r}) — zero variance."
         )
 
+    # low variance — numeric feature with only 2 unique values is likely trivial
+    # exception: binary features from Y/N encoding are valid
+    if (df[col].dtype in ['int64', 'int32', 'float64'] and
+            df[col].nunique() == 2 and
+            plan.pandas_code and
+            'nunique' in plan.pandas_code):
+        issues.append(
+            f"'{col}' has only 2 unique values from a nunique aggregation — "
+            f"likely all groups have the same count. Zero predictive variance."
+        )
+
     if hasattr(df[col].dtype, 'name') and 'timedelta' in str(df[col].dtype):
         issues.append(
             f"'{col}' is timedelta64 — ML models need numeric. "

@@ -54,25 +54,20 @@ def _expand_queries(objective: str, domain_hint: str, n: int = 3) -> list[str]:
 
 def _generate_arxiv_query(objective: str, domain_hint: str) -> str:
     """Generate a single arXiv-specific query from the objective."""
-    domain_hint = domain_hint.replace("-", " ")
-
     prompt = (
-        f"Generate ONE short arXiv search query to find academic papers "
-        f"about feature engineering for this specific ML task.\n"
+        f"Generate ONE short arXiv search query (4-8 words) for finding papers about "
+        f"feature engineering and data preprocessing for this ML task.\n"
         f"Domain: {domain_hint}\n"
-        f"Objective: {objective[:200]}\n\n"
+        f"Objective: {objective[:300]}\n\n"
         f"Rules:\n"
-        f"- Start with 'abs:' followed by 4-6 words\n"
-        f"- Use the MOST SPECIFIC domain keyword (dataset name or disease name)\n"
-        f"- Do NOT include generic terms like 'machine learning', 'tabular', 'preprocessing'\n"
-        f"- Return ONLY the query string, nothing else"
+        f"- Focus on feature engineering, data preprocessing, or tabular ML\n"
+        f"- Use 'abs:' prefix to search in abstracts\n"
+        f"- Include keywords like: feature engineering, preprocessing, tabular, machine learning\n"
+        f"- Return ONLY the query, nothing else\n"
+        f"Example: abs:cancer drug response feature engineering tabular"
     )
     response = llm.invoke(prompt)
-    query = response.content.strip()
-    # ensure it starts with abs:
-    if not query.startswith("abs:"):
-        query = f"abs:{query}"
-    return query
+    return response.content.strip()
 
 
 def _search_arxiv(query: str, max_results: int = 5) -> list[dict]:
@@ -89,9 +84,6 @@ def _search_arxiv(query: str, max_results: int = 5) -> list[dict]:
                     "query": query,
                     "max_results": max_results
                 })
-                print(f"[arxiv] raw result content count: {len(result.content)}")
-                if result.content:
-                    print(f"[arxiv] first item text[:100]: {result.content[0].text[:100]}")
                 papers = [json.loads(item.text) for item in result.content]
 
                 enriched = []
@@ -160,8 +152,6 @@ def _extract_arxiv_features(papers: list[dict], objective: str, column_schema: d
                 f"Return a JSON array with objects containing:\n"
                 f"  name, description, formula (pandas), requires_external_data (bool), required_data (str if external)\n"
                 f"Return ONLY the JSON array. If nothing relevant found, return [].\n\n"
-                f"AVOID: simple dtype casts of single existing columns (e.g. Y/N → 0/1 without combining with other columns)\n"
-                f"AVOID: features that use target columns directly\n\n"
                 f"Paper text:\n{text[:8000]}"
             )
             response = llm.invoke(prompt)
@@ -172,30 +162,19 @@ def _extract_arxiv_features(papers: list[dict], objective: str, column_schema: d
                     raw = raw[4:]
             extracted = json.loads(raw.strip())
             for f in extracted:
-                # normalize name to snake_case
-                import re as _re
-                raw_name = f.get("name", "")
-                snake_name = _re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', raw_name).lower()
-                snake_name = _re.sub(r'[^a-z0-9_]', '_', snake_name)
-                snake_name = _re.sub(r'_+', '_', snake_name).strip('_')
                 features.append(ResearchFeature(
-                    name=snake_name,
+                    name=f.get("name", ""),
                     description=f.get("description", ""),
                     formula_hint=f.get("formula", ""),
                     source="arxiv",
                 ))
                 ext = " [external data required]" if f.get("requires_external_data") else ""
-                print(f"[arxiv] Feature found: {snake_name}{ext} (source: arxiv)")
+                print(f"[arxiv] Feature found: {f.get('name')}{ext} (source: arxiv)")
         except Exception as e:
             print(f"[arxiv] Extraction error for {paper['id']}: {e}")
 
-    seen_names = set()
-    unique_features = []
-    for f in features:
-        if f.name not in seen_names:
-            seen_names.add(f.name)
-            unique_features.append(f)
-    return unique_features
+    return features
+
 
 def research_features(state: AgentState) -> dict:
     """ReAct node — Kaggle-focused multi-search with chain-of-thought."""
@@ -210,10 +189,8 @@ def research_features(state: AgentState) -> dict:
 
         domain_hint = llm.invoke(
             f"Extract a short 5-10 word domain title from this ML objective. "
-            f"Return ONLY the title, as plain words separated by spaces, no hyphens or underscores.\n\n{objective[:500]}"
+            f"Return ONLY the title, nothing else.\n\n{objective[:500]}"
         ).content.strip()
-        domain_hint = domain_hint.replace("-", " ").replace("_", " ")
-
         print(f"[research_features] Domain: {domain_hint}")
         print(f"[research_features] Searching for domain-specific features...")
 
@@ -269,41 +246,35 @@ def research_features(state: AgentState) -> dict:
                 columns = path_to_df(state["df"]).columns.tolist() if state.get("df") else []
                 arxiv_features = _extract_arxiv_features(papers, objective, state.get("column_schema", {}))
                 if arxiv_features:
-                    print(f"[arxiv] Added {len(arxiv_features)} features to research context")
-                    arxiv_lines = "\n".join(
-                        f"  - {f.name}: {f.description} → {f.formula_hint} [SOURCE: arxiv]"
+                    # inject arxiv features as an AIMessage in research_messages
+                    arxiv_content = "Additional features from arXiv papers:\n" + "\n".join(
+                        f"  - {f.name}: {f.description} [SOURCE: arxiv] → {f.formula_hint}"
                         for f in arxiv_features
                     )
-                    messages.append(AIMessage(content=f"Features from arXiv papers:\n{arxiv_lines}"))
-                    messages_update = {"research_messages": messages}
+                    messages.append(AIMessage(content=arxiv_content))
+                    print(f"[arxiv] Added {len(arxiv_features)} features to research context")
                 else:
                     print("[arxiv] No features extracted from papers")
-                    messages_update = {"research_messages": messages}
             else:
                 print("[arxiv] No papers found — continuing with Serper only")
-                messages_update = {"research_messages": messages}
         else:
             print(f"[arxiv] Server not found at {_ARXIV_SERVER_PATH} — skipping")
-            messages_update = {"research_messages": messages}
 
     else:
         messages          = existing
         is_first_or_retry = False
-        messages_update   = None
 
     research_llm = _research_llm_forced if is_first_or_retry else _research_llm_auto
 
     response = research_llm.invoke(messages)
 
+    # log what the LLM actually searched for
     if hasattr(response, "tool_calls") and response.tool_calls:
         for tc in response.tool_calls:
             query = tc.get("args", {}).get("query", "")
             if query:
                 print(f"[research] LLM searched: {query}")
 
-    if messages_update:
-        messages_update["research_messages"] = messages + [response]
-        return messages_update
     return {"research_messages": [response]}
 
 
@@ -322,16 +293,16 @@ def extract_candidates(state: AgentState) -> dict:
     """Extract feature candidates using structured output — no JSON parsing."""
     messages = state.get("research_messages", [])
     if not messages:
-        return {"feature_candidates": [], "research_formula_hints": {}, }
+        return {"feature_candidates": [], "research_formula_hints": {}}
 
-    # extract Serper results as structured candidates
-    serper_candidates = []
+    # log Serper queries and result titles for debugging
     for msg in messages:
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
                 query = tc.get("args", {}).get("query", "")
                 if query:
                     print(f"[research] Serper query: {query}")
+        # ToolMessage has type="tool" — check content for Serper results
         if hasattr(msg, "type") and msg.type == "tool":
             raw = msg.content if isinstance(msg.content, str) else str(msg.content)
             if raw.strip():
@@ -348,23 +319,16 @@ def extract_candidates(state: AgentState) -> dict:
                         print(f"  • {line[:100]}")
                         if url:
                             print(f"    {url}")
-                        serper_candidates.append({
-                            "name": line[:80],
-                            "description": line[:200],
-                            "formula_hint": "",
-                            "source": "serper",
-                            "url": url,
-                        })
                         count += 1
                     i += 1
 
-    # build context from Serper messages
+    # build context from all messages for the synthesis call
     conversation = []
     for msg in messages:
         if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content.strip():
             conversation.append(msg.content)
-    context = "\n\n---\n\n".join(conversation)
 
+    context = "\n\n---\n\n".join(conversation)
     if not context:
         return {"feature_candidates": [], "research_formula_hints": {}}
 
@@ -380,30 +344,12 @@ def extract_candidates(state: AgentState) -> dict:
             "These are prediction targets — features derived from them cause leakage.\n"
         )
 
-    # arXiv features injected as AIMessage in research_messages — already in context
-    # extract them explicitly for the prompt
-    arxiv_section = ""
-    for msg in messages:
-        if hasattr(msg, "type") and msg.type == "ai":
-            raw = msg.content if isinstance(msg.content, str) else ""
-            if "[SOURCE: arxiv]" in raw:
-                arxiv_section = f"\n{raw}\n"
-                break
-
-
-    non_target_cols = [c for c in df.columns.tolist() if c not in target_cols]
-
     prompt = (
         f"Based on this research:\n\n{context}\n\n"
-        f"{arxiv_section}"
         f"Objective: {objective}\n"
         f"{columns_info}\n"
         f"{target_note}\n"
-        "The context above contains TWO types of information:\n"
-        "  1. Web search results (Serper) — use these as INSPIRATION to propose new features with pandas formulas\n"
-        "  2. Features from arXiv papers marked [SOURCE: arxiv] — INCLUDE these DIRECTLY in your list as-is, do not rephrase or replace them\n\n"
         "Extract a curated list of 8-10 specific, computable feature candidates.\n"
-        "Include relevant features from BOTH the web research AND the arXiv papers above.\n"
         "If the research context is limited, use your domain knowledge to propose additional "
         "relevant features based on the available columns.\n"
         "Each feature must:\n"
@@ -425,9 +371,6 @@ def extract_candidates(state: AgentState) -> dict:
         "(e.g. Y→1/N→0 is trivial if the column already exists as Y/N).\n"
         "AVOID: methodology names like 'feature selection' or 'normalization'.\n"
         "AVOID: features with no transformation beyond dtype casting."
-        f"\nIMPORTANT: propose features that cover a DIVERSE set of input columns.\n"
-        f"Do not propose more than 2 features using the same source column.\n"
-        f"Make sure ALL these columns are covered by at least one feature: {non_target_cols}\n"
     )
 
     result: ResearchFeatureList = research_structured_llm.invoke(prompt)
@@ -442,11 +385,11 @@ def extract_candidates(state: AgentState) -> dict:
         if f.formula_hint:
             formula_hints[label] = f.formula_hint
         hint_str   = f"  → {f.formula_hint}" if f.formula_hint else ""
-        source_str = f"  [source: {f.source}]" if hasattr(f, "source") and f.source else ""
+        source_str = f"  [source: {f.source}]" if hasattr(f, "source") else ""
         print(f"  • {label}{hint_str}{source_str}")
 
     return {
-        "feature_candidates":     candidates,
+        "feature_candidates":    candidates,
         "research_formula_hints": formula_hints,
     }
 
@@ -613,25 +556,13 @@ def map_to_columns(state: AgentState) -> dict:
         for label, hint in formula_hints.items():
             hints_section += f"  {label} → {hint}\n"
 
-    target_cols  = state.get("target_columns", [])
-    print(f"[map_to_columns] target_cols: {target_cols}")
-    target_str = ", ".join(f"'{c}'" for c in target_cols)
-    target_block = (
-        f"\nTARGET COLUMNS (NEVER use in feature formulas): {target_str}\n"
-        "EXCLUDE any candidate whose 'needs' list contains a target column.\n"
-        "These columns are what we predict — using them causes data leakage.\n"
-        "EXCEPTION: lag/shift features with POSITIVE shift only (e.g. shift(1), shift(7)) on target columns are NOT leakage "
-        "— they use past values known at prediction time. INCLUDE these.\n"
-        "NEVER include features with negative shift (e.g. shift(-1)) — these use future values.\n"
-    )
-
     candidates_str = "\n".join(f"  - {c}" for c in candidates)
 
     prompt = f"""You are a feature engineering expert.
 
 Available CSV columns:
 {chr(10).join(schema_lines)}
-{hints_section}{grouping_hint}{target_block}
+{hints_section}{grouping_hint}
 Feature candidates to evaluate for feasibility:
 {candidates_str}
 
@@ -665,9 +596,8 @@ For each feasible feature provide:
 
     # collect infeasible candidates for recommendations
     infeasible_strs = [c for c in candidates if not any(c.startswith(n) for n in feasible_names)]
-    print(f"[map_to_columns] infeasible: {infeasible_strs}")
+
     print(f"[map_to_columns] {len(result.features)}/{len(candidates)} features feasible:")
-    
     for f in result.features:
         print(f"  ✓ {f.name}: {f.description} (needs: {', '.join(f.needs)})")
     for c in infeasible_strs:

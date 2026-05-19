@@ -17,33 +17,43 @@ from feature_engineer.storage.parquet import path_to_df
 
 def generate_recommendations(state: AgentState) -> dict:
     """Generate top-5 recommended features from research context that need additional data."""
-    objective        = state.get("objective", "")
-    completed        = state.get("completed_features", [])
-    original_cols    = state.get("original_columns", [])
-    infeasible       = state.get("infeasible_features", [])
-    feature_candidates = state.get("feature_candidates", [])
-    if not feature_candidates and not infeasible:
-        return {"feature_recommendations": []}
+    messages        = state.get("research_messages", [])
+    objective       = state.get("objective", "")
+    completed       = state.get("completed_features", [])
+    original_cols   = state.get("original_columns", [])
+    infeasible      = state.get("infeasible_features", [])
 
-    candidates_block = ""
-    if feature_candidates:
-        candidates_block = "\nAll feature candidates proposed (from Serper + arXiv):\n" + \
-            "\n".join(f"  - {c}" for c in feature_candidates) + "\n"
+    # build context from Serper results
+    context_lines = []
+    for msg in messages:
+        if hasattr(msg, "type") and msg.type == "tool":
+            raw = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if raw.strip():
+                context_lines.append(raw[:500])
+    context = "\n\n".join(context_lines[:6])
 
     infeasible_block = ""
     if infeasible:
-        infeasible_block = "\nFeatures NOT computable from available columns:\n" + \
-            "\n".join(f"  - {f}" for f in infeasible[:20]) + "\n"
+        infeasible_block = (
+            "\nFeatures identified from research but NOT computable from available columns "
+            "(require additional data):\n" +
+            "\n".join(f"  - {f}" for f in infeasible[:20])
+        )
+
+    if not context and not infeasible:
+        return {"feature_recommendations": []}
 
     prompt = f"""You are a feature engineering expert in the domain of: {objective[:200]}
 
 Available columns: {original_cols}
 
 Features already generated: {completed}
-{candidates_block}
 {infeasible_block}
 
-Based on the above, identify the TOP 5 most important features that:
+Research context (from literature):
+{context}
+
+Based on the research context and infeasible features above, identify the TOP 5 most important features that:
 1. Would be highly predictive for the objective
 2. CANNOT be computed from the available columns above
 3. Would require additional data (specify what data)
