@@ -70,7 +70,8 @@ feature_engineer/
 ├── security/               # AST validator for generated code
 ├── storage/
 │   ├── arxiv_papers/       # downloaded PDF cache
-│   └── parquet helpers
+│   ├── database.py         # SQLite run history
+│   └── parquet.py          # parquet caching helpers
 ├── llm/                    # LLM setup, Serper tool, naming
 ├── nodes/
 │   ├── research.py         # Serper ReAct loop + arXiv MCP integration
