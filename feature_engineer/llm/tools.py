@@ -3,7 +3,7 @@ LangChain Tool wrappers for external APIs.
 Each tool is independently testable by mocking the underlying HTTP call.
 """
 import requests
-from langchain.agents import Tool
+from langchain_core.tools import Tool
 
 from feature_engineer.config import SERPER_KEY
 from feature_engineer.llm.setup import llm

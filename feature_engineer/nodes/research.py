@@ -3,8 +3,8 @@ Research nodes — web search ReAct loop + structured output everywhere.
 
 No manual JSON parsing — all LLM outputs use Pydantic structured output.
 """
-import asyncio
 import json
+import re
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -54,8 +54,6 @@ def _expand_queries(objective: str, domain_hint: str, n: int = 3) -> list[str]:
 
 def _generate_arxiv_query(objective: str, domain_hint: str) -> str:
     """Generate a single arXiv-specific query from the objective."""
-    domain_hint = domain_hint.replace("-", " ")
-
     prompt = (
         f"Generate ONE short arXiv search query to find academic papers "
         f"about feature engineering for this specific ML task.\n"
@@ -72,51 +70,8 @@ def _generate_arxiv_query(objective: str, domain_hint: str) -> str:
     # ensure it starts with abs:
     if not query.startswith("abs:"):
         query = f"abs:{query}"
+        query = query.replace("abs: ", "abs:")
     return query
-
-
-def _search_arxiv(query: str, max_results: int = 5) -> list[dict]:
-    """Search arXiv and return papers with text content via MCP server."""
-    try:
-        import nest_asyncio
-        nest_asyncio.apply()
-        from agents.mcp import MCPServerStdio
-
-        async def _run():
-            params = {"command": "python", "args": [str(_ARXIV_SERVER_PATH)]}
-            async with MCPServerStdio(params=params, client_session_timeout_seconds=60) as server:
-                result = await server.call_tool("search_arxiv", {
-                    "query": query,
-                    "max_results": max_results
-                })
-                print(f"[arxiv] raw result content count: {len(result.content)}")
-                if result.content:
-                    print(f"[arxiv] first item text[:100]: {result.content[0].text[:100]}")
-                papers = [json.loads(item.text) for item in result.content]
-
-                enriched = []
-                for paper in papers:
-                    try:
-                        await server.call_tool("download_paper", {
-                            "paper_id": paper["id"],
-                            "pdf_url":  paper["pdf_url"]
-                        })
-                        read_result = await server.call_tool("read_paper", {
-                            "paper_id": paper["id"]
-                        })
-                        paper["full_text"] = read_result.content[0].text
-                    except Exception as e:
-                        print(f"[arxiv] Could not read {paper['id']}: {e}")
-                        paper["full_text"] = paper.get("abstract", "")
-                    enriched.append(paper)
-                return enriched
-
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_run())
-
-    except Exception as e:
-        print(f"[arxiv] MCP server error: {e}")
-        return []
 
 
 def _extract_arxiv_features(papers: list[dict], objective: str, column_schema: dict) -> list[ResearchFeature]:
@@ -151,7 +106,8 @@ def _extract_arxiv_features(papers: list[dict], objective: str, column_schema: d
                 f"Objective: {objective[:200]}\n\n"
                 f"Available dataset columns with their semantic types and sample values:\n"
                 f"{schema_str}\n\n"
-                f"Extract feature engineering transformations from this paper.\n"
+                f"Use this paper text to inspire for data transformation to use in features.\n"
+                f"If nothing relevant is found, return [].\n"
                 f"For each feature:\n"
                 f"  - If it CAN be computed from the available columns (semantic match, "
                 f"even if column names differ), return it with formula using actual column names\n"
@@ -162,7 +118,7 @@ def _extract_arxiv_features(papers: list[dict], objective: str, column_schema: d
                 f"Return ONLY the JSON array. If nothing relevant found, return [].\n\n"
                 f"AVOID: simple dtype casts of single existing columns (e.g. Y/N → 0/1 without combining with other columns)\n"
                 f"AVOID: features that use target columns directly\n\n"
-                f"Paper text:\n{text[:8000]}"
+                f"Paper text:\n{text[:10000]}"
             )
             response = llm.invoke(prompt)
             raw = response.content.strip()
@@ -173,11 +129,10 @@ def _extract_arxiv_features(papers: list[dict], objective: str, column_schema: d
             extracted = json.loads(raw.strip())
             for f in extracted:
                 # normalize name to snake_case
-                import re as _re
                 raw_name = f.get("name", "")
-                snake_name = _re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', raw_name).lower()
-                snake_name = _re.sub(r'[^a-z0-9_]', '_', snake_name)
-                snake_name = _re.sub(r'_+', '_', snake_name).strip('_')
+                snake_name = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', raw_name).lower()
+                snake_name = re.sub(r'[^a-z0-9_]', '_', snake_name)
+                snake_name = re.sub(r'_+', '_', snake_name).strip('_')
                 features.append(ResearchFeature(
                     name=snake_name,
                     description=f.get("description", ""),
@@ -189,15 +144,10 @@ def _extract_arxiv_features(papers: list[dict], objective: str, column_schema: d
         except Exception as e:
             print(f"[arxiv] Extraction error for {paper['id']}: {e}")
 
-    seen_names = set()
-    unique_features = []
-    for f in features:
-        if f.name not in seen_names:
-            seen_names.add(f.name)
-            unique_features.append(f)
-    return unique_features
+    return features
 
-def research_features(state: AgentState) -> dict:
+
+async def research_features(state: AgentState) -> dict:
     """ReAct node — Kaggle-focused multi-search with chain-of-thought."""
     objective         = state.get("objective", "")
     existing          = state.get("research_messages", [])
@@ -208,12 +158,11 @@ def research_features(state: AgentState) -> dict:
             print("[research_features] No objective — skipping.")
             return {"feature_candidates": [], "research_messages": []}
 
-        domain_hint = llm.invoke(
+        domain_hint = (await llm.ainvoke(
             f"Extract a short 5-10 word domain title from this ML objective. "
-            f"Return ONLY the title, as plain words separated by spaces, no hyphens or underscores.\n\n{objective[:500]}"
-        ).content.strip()
+            f"Return ONLY the title as plain words separated by spaces, no hyphens or underscores.\n\n{objective[:500]}"
+        )).content.strip()
         domain_hint = domain_hint.replace("-", " ").replace("_", " ")
-
         print(f"[research_features] Domain: {domain_hint}")
         print(f"[research_features] Searching for domain-specific features...")
 
@@ -259,32 +208,76 @@ def research_features(state: AgentState) -> dict:
         messages          = [system, human]
         is_first_or_retry = True
 
-        # ── arXiv MCP — runs in parallel with Serper, adds features to messages ──
+        # ── arXiv MCP — connects to HTTP server started by main.py ──
         if _ARXIV_SERVER_PATH.exists():
             arxiv_query = _generate_arxiv_query(objective, domain_hint)
             print(f"[arxiv] Query: {arxiv_query}")
-            papers = _search_arxiv(arxiv_query, max_results=5)
-            if papers:
-                print(f"[arxiv] Found {len(papers)} papers")
-                columns = path_to_df(state["df"]).columns.tolist() if state.get("df") else []
-                arxiv_features = _extract_arxiv_features(papers, objective, state.get("column_schema", {}))
-                if arxiv_features:
-                    print(f"[arxiv] Added {len(arxiv_features)} features to research context")
-                    arxiv_lines = "\n".join(
-                        f"  - {f.name}: {f.description} → {f.formula_hint} [SOURCE: arxiv]"
-                        for f in arxiv_features
-                    )
-                    messages.append(AIMessage(content=f"Features from arXiv papers:\n{arxiv_lines}"))
-                    messages_update = {"research_messages": messages}
+            try:
+                from langchain_mcp_adapters.client import MultiServerMCPClient
+                client = MultiServerMCPClient({
+                    "arxiv": {
+                        "url": "http://127.0.0.1:8000/mcp",
+                        "transport": "http",
+                    }
+                })
+                tools = await client.get_tools()
+                tools = {t.name: t for t in tools}
+
+                    # search
+                search_result = await tools["search_arxiv"].ainvoke({
+                        "query": arxiv_query, "max_results": 5
+                    })
+                print(f"[arxiv] search_result type: {type(search_result)}")
+                print(f"[arxiv] search_result[:200]: {str(search_result)[:200]}")
+
+                # unwrap LangChain tool output format
+                if isinstance(search_result, list) and search_result and "text" in search_result[0]:
+                    papers = [json.loads(item["text"]) for item in search_result]
                 else:
-                    print("[arxiv] No features extracted from papers")
-                    messages_update = {"research_messages": messages}
-            else:
-                print("[arxiv] No papers found — continuing with Serper only")
-                messages_update = {"research_messages": messages}
+                    papers = json.loads(search_result) if isinstance(search_result, str) else search_result
+
+                print(f"[arxiv] Found {len(papers)} papers")
+
+                    # download + read each paper
+                enriched = []
+                for paper in papers:
+                    try:
+                        await tools["download_paper"].ainvoke({
+                                "paper_id": paper["id"], "pdf_url": paper["pdf_url"]
+                            })
+                        full_text = await tools["read_paper"].ainvoke({
+                                "paper_id": paper["id"]
+                            })
+                        # unwrap
+                        if isinstance(full_text, list) and full_text and "text" in full_text[0]:
+                            full_text = full_text[0]["text"]
+
+                    except Exception as e:
+                        print(f"[arxiv] Could not read {paper['id']}: {e}")
+                        paper["full_text"] = paper.get("abstract", "")
+                    enriched.append(paper)
+
+                if enriched:
+                    arxiv_features = _extract_arxiv_features(enriched, objective, state.get("column_schema", {}))
+                    if arxiv_features:
+                        print(f"[arxiv] Added {len(arxiv_features)} features to research context")
+                        arxiv_lines = "\n".join(
+                            f"  - {f.name}: {f.description} → {f.formula_hint} [SOURCE: arxiv]"
+                            for f in arxiv_features
+                        )
+                        messages.append(AIMessage(content=f"Features from arXiv papers:\n{arxiv_lines}"))
+                    else:
+                        print("[arxiv] No features extracted from papers")
+                else:
+                    print("[arxiv] No papers found — continuing with Serper only")
+            except Exception as e:
+                import traceback
+                print(f"[arxiv] MCP client error: {e}")
+                traceback.print_exc()
         else:
             print(f"[arxiv] Server not found at {_ARXIV_SERVER_PATH} — skipping")
-            messages_update = {"research_messages": messages}
+
+        messages_update = {"research_messages": messages}
 
     else:
         messages          = existing
@@ -293,7 +286,7 @@ def research_features(state: AgentState) -> dict:
 
     research_llm = _research_llm_forced if is_first_or_retry else _research_llm_auto
 
-    response = research_llm.invoke(messages)
+    response = await research_llm.ainvoke(messages)
 
     if hasattr(response, "tool_calls") and response.tool_calls:
         for tc in response.tool_calls:
@@ -390,9 +383,6 @@ def extract_candidates(state: AgentState) -> dict:
                 arxiv_section = f"\n{raw}\n"
                 break
 
-
-    non_target_cols = [c for c in df.columns.tolist() if c not in target_cols]
-
     prompt = (
         f"Based on this research:\n\n{context}\n\n"
         f"{arxiv_section}"
@@ -425,9 +415,6 @@ def extract_candidates(state: AgentState) -> dict:
         "(e.g. Y→1/N→0 is trivial if the column already exists as Y/N).\n"
         "AVOID: methodology names like 'feature selection' or 'normalization'.\n"
         "AVOID: features with no transformation beyond dtype casting."
-        f"\nIMPORTANT: propose features that cover a DIVERSE set of input columns.\n"
-        f"Do not propose more than 2 features using the same source column.\n"
-        f"Make sure ALL these columns are covered by at least one feature: {non_target_cols}\n"
     )
 
     result: ResearchFeatureList = research_structured_llm.invoke(prompt)
@@ -588,6 +575,9 @@ def map_to_columns(state: AgentState) -> dict:
         return {"feasible_features": []}
 
     df           = path_to_df(state["df"])
+    print(f"[map_to_columns] df.columns: {df.columns.tolist()}")
+    print(f"[map_to_columns] column_schema keys: {list(state.get('column_schema', {}).keys())}")
+
     schema_lines = [
         f"  {col!r}: dtype={df[col].dtype}, sample={df[col].dropna().head(3).tolist()}"
         for col in df.columns
@@ -614,16 +604,12 @@ def map_to_columns(state: AgentState) -> dict:
             hints_section += f"  {label} → {hint}\n"
 
     target_cols  = state.get("target_columns", [])
-    print(f"[map_to_columns] target_cols: {target_cols}")
-    target_str = ", ".join(f"'{c}'" for c in target_cols)
-    target_block = (
-        f"\nTARGET COLUMNS (NEVER use in feature formulas): {target_str}\n"
-        "EXCLUDE any candidate whose 'needs' list contains a target column.\n"
-        "These columns are what we predict — using them causes data leakage.\n"
-        "EXCEPTION: lag/shift features with POSITIVE shift only (e.g. shift(1), shift(7)) on target columns are NOT leakage "
-        "— they use past values known at prediction time. INCLUDE these.\n"
-        "NEVER include features with negative shift (e.g. shift(-1)) — these use future values.\n"
-    )
+    target_block = ""
+    if target_cols:
+        target_block = (
+            f"\nTARGET COLUMNS — never use these in feature formulas: {target_cols}\n"
+            "EXCLUDE any candidate whose formula uses a target column directly or indirectly.\n"
+        )
 
     candidates_str = "\n".join(f"  - {c}" for c in candidates)
 
@@ -656,18 +642,24 @@ For each feasible feature provide:
     result: FeasibleFeatureList = mapping_llm.invoke(prompt)
 
     feasible_strs   = []
-    feasible_names  = set()
+    feasible_names_lower = set()
     for f in result.features:
         needs_str = ", ".join(f.needs)
         label = f"{f.name}: {f.description} (needs: {needs_str})"
         feasible_strs.append(label)
-        feasible_names.add(f.name)
+        feasible_names_lower.add(f.name.lower())
+
+    print(f"[map_to_columns] feasible_names_lower: {feasible_names_lower}")
+    for c in candidates:
+        matches = [n for n in feasible_names_lower if c.lower().startswith(n)]
+        print(f"[map_to_columns] candidate: {c[:50]} → matches: {matches}")
 
     # collect infeasible candidates for recommendations
-    infeasible_strs = [c for c in candidates if not any(c.startswith(n) for n in feasible_names)]
-    print(f"[map_to_columns] infeasible: {infeasible_strs}")
+    infeasible_strs = [c for c in candidates if not any(
+        c.lower().startswith(n) for n in feasible_names_lower
+    )]
+
     print(f"[map_to_columns] {len(result.features)}/{len(candidates)} features feasible:")
-    
     for f in result.features:
         print(f"  ✓ {f.name}: {f.description} (needs: {', '.join(f.needs)})")
     for c in infeasible_strs:

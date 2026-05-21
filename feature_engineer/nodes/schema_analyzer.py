@@ -38,7 +38,7 @@ def _infer_semantic_type(col: pd.Series) -> str:
             return "categorical_numeric"
         return "numeric_continuous"
 
-    if dtype == object:
+    if pd.api.types.is_object_dtype(col) or pd.api.types.is_string_dtype(col):
         non_null = col.dropna()
         if len(non_null) == 0:
             return "unknown"

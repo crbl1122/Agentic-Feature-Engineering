@@ -4,6 +4,9 @@ CLI entry point — thin wrapper that delegates to ui.app or runs graph directly
 import argparse
 import asyncio
 import os
+import subprocess
+import sys
+import time
 import uuid
 
 from feature_engineer.config import DEFAULT_MAX_FEATURES, DEFAULT_RECURSION_LIMIT, DB_PATH, OUTPUT_DIR
@@ -12,8 +15,38 @@ from feature_engineer.state import empty_state
 from feature_engineer.storage.database import init_db, save_run
 from feature_engineer.storage.parquet import init_dirs
 
+_ARXIV_SERVER_PATH = (
+    __import__("pathlib").Path(__file__).parent / "mcp_servers" / "arxiv_server.py"
+)
+_arxiv_proc = None
+
+
+def _start_arxiv_server() -> subprocess.Popen | None:
+    """Start arXiv MCP HTTP server as a background subprocess."""
+    if not _ARXIV_SERVER_PATH.exists():
+        print(f"[main] arXiv server not found at {_ARXIV_SERVER_PATH} — skipping")
+        return None
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(_ARXIV_SERVER_PATH),
+            "--transport", "streamable-http"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)
+        print(f"[main] arXiv MCP server started on http://127.0.0.1:8000 (pid={proc.pid})")
+        return proc
+    
+        time.sleep(2)  # wait for server to be ready
+        print(f"[main] arXiv MCP server started on http://127.0.0.1:{_ARXIV_PORT} (pid={proc.pid})")
+        return proc
+    except Exception as e:
+        print(f"[main] Could not start arXiv server: {e}")
+        return None
+
 
 def main() -> None:
+    global _arxiv_proc
     parser = argparse.ArgumentParser(description="LangGraph feature engineering agent")
     parser.add_argument("--input",           default="",  help="Path to input CSV")
     parser.add_argument("--output",          default="",  help="Path to write enriched CSV")
@@ -24,15 +57,22 @@ def main() -> None:
     parser.add_argument("--ui",              action="store_true", help="Launch Gradio UI")
     args = parser.parse_args()
 
-    if args.ui:
-        from feature_engineer.ui.app import launch_ui
-        launch_ui()
-        return
+    _arxiv_proc = _start_arxiv_server()
 
-    if not args.input or not args.output:
-        parser.error("--input and --output are required when not using --ui")
+    try:
+        if args.ui:
+            from feature_engineer.ui.app import launch_ui
+            launch_ui()
+            return
 
-    asyncio.run(_run_cli(args))
+        if not args.input or not args.output:
+            parser.error("--input and --output are required when not using --ui")
+
+        asyncio.run(_run_cli(args))
+    finally:
+        if _arxiv_proc is not None:
+            _arxiv_proc.terminate()
+            print(f"[main] arXiv MCP server stopped")
 
 
 async def _run_cli(args) -> None:

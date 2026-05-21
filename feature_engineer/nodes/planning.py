@@ -32,6 +32,25 @@ def feature_planner(state: AgentState) -> dict:
     feasible = state.get("ranked_features") or state.get("feasible_features", [])
     formula_hints = state.get("research_formula_hints", {})
 
+    # ── memory: inject similar features from past runs ──────────────────────
+    from feature_engineer.storage.database import get_similar_domain_features, init_db
+    init_db()
+    memory_features = get_similar_domain_features(objective, threshold=0.3)
+    if memory_features:
+        print(f"[feature_planner] memory: {len(memory_features)} similar features from past runs")
+        for mf in memory_features[:5]:
+            print(f"  • {mf['feature_name']} (similarity={mf['similarity']}) → {mf['formula'][:60]}")
+        # add memory features to feasible list as formula hints
+        for mf in memory_features:
+            label = f"{mf['feature_name']}: from memory (similarity={mf['similarity']})"
+            if label not in feasible:
+                feasible.append(label)
+            # strip assignment syntax: df['col'] = expr → expr
+            formula = mf['formula']
+            if '=' in formula and '==' not in formula and '>= ' not in formula and '<=' not in formula and '!=' not in formula:
+                formula = formula.split('=', 1)[1].strip()
+            formula_hints[label] = formula
+
     # clean feasible feature labels
     def _clean_feasible(f: str) -> str:
         base = f.split(" (")[0].strip()
@@ -45,11 +64,7 @@ def feature_planner(state: AgentState) -> dict:
         feasible_lines = []
         for f in feasible_clean:
             name = f.split(":")[0].strip()
-            hint = next(
-                (v for k, v in formula_hints.items()
-                if k.split(":")[0].strip().lower().replace(" ", "_") == name),
-                ""
-            )
+            hint = formula_hints.get(f, formula_hints.get(name, ""))
             if hint:
                 feasible_lines.append(f"  - {f}  →  USE THIS FORMULA: {hint}")
             else:
@@ -391,6 +406,7 @@ For each feature fill in:
                 "transform('sum')", "transform(\"sum\")",
                 "transform('count')", "transform(\"count\")",
                 ".eq('Y')", '.eq("Y")', "value_counts",
+                ".count()", ".nunique()",
             ]
             if any(p in code for p in cohort_patterns):
                 print(f"  verdict    : OVERRIDE → KEEP ✓ (cohort statistic — low cardinality is expected)")

@@ -170,6 +170,8 @@ def should_execute(state: AgentState) -> str:
     if "Syntax error" in error:
         print(f"[router] Syntax error in '{state['plan'].feature_name}' — routing to revise_plan.")
         return "revise"
+    if "apply(lambda).transform()" in error:
+        return "revise"
 
     print(f"[router] AST blocked '{state['plan'].feature_name}' — skipping (unsafe code).")
     return "next" if state["feature_queue"] else "save"

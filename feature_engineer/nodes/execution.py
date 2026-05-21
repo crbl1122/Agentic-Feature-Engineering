@@ -327,8 +327,12 @@ def validate(state: AgentState) -> dict:
 
 def record_feature(state: AgentState) -> dict:
     """Append the validated feature name, plan and formula to completed lists."""
-    plan = state["plan"]
-    print(f"[record_feature] Recording '{plan.feature_name}' as completed.")
+    from feature_engineer.storage.database import save_feature_memory
+    plan      = state["plan"]
+    objective = state.get("objective", "")
+    saved     = save_feature_memory(plan.feature_name, plan.pandas_code, objective)
+    print(f"[record_feature] Recording '{plan.feature_name}' as completed."
+          + (" [saved to memory]" if saved else " [formula already in memory]"))
     return {
         "completed_features": [plan.feature_name],
         "completed_plans":    [plan.model_dump()],

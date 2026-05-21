@@ -1,5 +1,5 @@
 """
-SQLite persistence — runs history table.
+SQLite persistence — runs history + feature memory.
 LangGraph checkpoints are managed separately by AsyncSqliteSaver.
 """
 import json
@@ -13,7 +13,7 @@ from feature_engineer.config import DB_PATH
 
 
 def init_db(db_path: str = DB_PATH) -> None:
-    """Create runs table and migrate schema if needed."""
+    """Create runs table and feature_memory table, migrate schema if needed."""
     with sqlite3.connect(db_path) as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS runs (
@@ -32,6 +32,18 @@ def init_db(db_path: str = DB_PATH) -> None:
         cols = [r[1] for r in con.execute("PRAGMA table_info(runs)").fetchall()]
         if "features_json" not in cols:
             con.execute("ALTER TABLE runs ADD COLUMN features_json TEXT")
+
+        # ── Feature memory table ────────────────────────────────────────────
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS feature_memory (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                feature_name TEXT NOT NULL,
+                formula      TEXT NOT NULL UNIQUE,
+                objective    TEXT NOT NULL,
+                created_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_fm_formula ON feature_memory(formula)")
 
 
 def save_run(thread_id: str, state: dict, status: str, db_path: str = DB_PATH) -> None:
@@ -63,6 +75,66 @@ def save_run(thread_id: str, state: dict, status: str, db_path: str = DB_PATH) -
             status,
             json.dumps(completed_plans),
         ))
+
+
+# ── Feature memory functions ────────────────────────────────────────────────────
+
+def save_feature_memory(feature_name: str, formula: str, objective: str, db_path: str = DB_PATH) -> bool:
+    """Save a validated feature to memory if formula not already present.
+
+    Returns True if saved, False if formula already exists.
+    """
+    with sqlite3.connect(db_path) as con:
+        exists = con.execute(
+            "SELECT 1 FROM feature_memory WHERE formula = ?", (formula,)
+        ).fetchone()
+        if exists:
+            return False
+        con.execute(
+            "INSERT INTO feature_memory (feature_name, formula, objective) VALUES (?, ?, ?)",
+            (feature_name, formula, objective[:500])
+        )
+        return True
+
+
+def get_similar_domain_features(current_objective: str, threshold: float = 0.3, db_path: str = DB_PATH) -> list[dict]:
+    """Return features from past runs with similar objectives using TF-IDF cosine similarity.
+
+    Returns list of dicts: {feature_name, formula, similarity}
+    """
+    with sqlite3.connect(db_path) as con:
+        rows = con.execute(
+            "SELECT feature_name, formula, objective FROM feature_memory"
+        ).fetchall()
+
+    if not rows:
+        return []
+
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        past_objectives = [r[2] for r in rows]
+        corpus = [current_objective] + past_objectives
+
+        vectorizer = TfidfVectorizer(stop_words="english")
+        tfidf      = vectorizer.fit_transform(corpus)
+        scores     = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
+
+        results = []
+        for i, score in enumerate(scores):
+            if score >= threshold:
+                results.append({
+                    "feature_name": rows[i][0],
+                    "formula":      rows[i][1],
+                    "similarity":   round(float(score), 3),
+                })
+        results.sort(key=lambda x: x["similarity"], reverse=True)
+        return results
+
+    except ImportError:
+        print("[feature_memory] sklearn not available — skipping TF-IDF match")
+        return []
 
 
 def load_history(db_path: str = DB_PATH) -> pd.DataFrame:
