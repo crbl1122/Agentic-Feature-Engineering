@@ -148,17 +148,6 @@ pytest tests/ -v
 - Only `pd`, `np`, `int`, `float`, `str`, `bool`, `abs`, `len`, `isinstance`, `set`, `list`, `dict`, `tuple` available
 - `__builtins__` set to `{}` — no shell access, no imports
 
-## Agentic patterns used
-
-- **ReAct** — Serper research loop (reason → search → observe → reason)
-- **Plan and Execute** — `feature_planner` plans all features upfront, executed one by one
-- **Reflection / Self-Critique** — `validate_plan` and `validate` review the agent's own output
-- **Self-Correction with Memory** — `revise_plan` retries with growing blacklist
-- **Tool Use** — Serper via `bind_tools()`, arXiv via MCP HTTP + `MultiServerMCPClient`
-- **Structured Output** — all LLM calls use Pydantic models (no manual JSON parsing)
-- **Episodic Memory** — TF-IDF feature memory across runs (`feature_memory` table)
-- **State Machine** — LangGraph stateful graph with conditional routing
-
 ## Tested datasets
 
 | Dataset | Domain | Features generated |
